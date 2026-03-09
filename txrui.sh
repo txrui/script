@@ -4796,7 +4796,7 @@ dd_reinstall() {
   echo ""
   echo "脚本来源: https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
   echo "默认系统: Debian 12"
-  echo "默认密码: Xiaorui0"
+  echo "默认密码: txrui"
   echo ""
   read -rp "请输入 'YES' 确认继续: " confirm
   
@@ -4809,8 +4809,8 @@ dd_reinstall() {
   read -rp "请输入系统版本 (默认: debian 12): " os_version
   os_version=${os_version:-"debian 12"}
   
-  read -rp "请输入root密码 (默认: Xiaorui0): " root_pwd
-  root_pwd=${root_pwd:-"Xiaorui0"}
+  read -rp "请输入root密码 (默认: txrui): " root_pwd
+  root_pwd=${root_pwd:-"txrui"}
   
   warn "最后确认：即将格式化系统并安装 $os_version，root密码: $root_pwd"
   read -rp "输入 'CONFIRM' 最终确认: " final_confirm
