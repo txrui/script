@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================
-# 田小瑞一键脚本 v1.0.3
+# 田小瑞一键脚本 v1.0.4
 #==============================================
 #
 # 一键运行命令:
@@ -42,6 +42,66 @@ safe_download() {
     fi
     ok "$desc 下载成功"
     return 0
+}
+
+# 高危操作二次确认（输入固定短语）
+confirm_dangerous_action() {
+    local action_desc="$1"
+    local token="${2:-CONFIRM}"
+
+    warn "⚠️ 高危操作：$action_desc"
+    echo "请输入 ${BOLD_YELLOW}$token${NC} 以继续，其他任意输入将取消。"
+    read -r user_confirm
+
+    if [[ "$user_confirm" != "$token" ]]; then
+        info "操作已取消"
+        return 1
+    fi
+    return 0
+}
+
+# 安全执行远程脚本：下载 -> (可选)校验SHA256 -> 执行
+run_remote_script_secure() {
+    local url="$1"
+    local expected_sha256="$2"
+    local tmp_script="/tmp/txrui_remote_$(date +%s)_$$.sh"
+
+    if [ -z "$url" ]; then
+        error "远程脚本地址为空"
+        return 1
+    fi
+
+    info "正在下载远程脚本..."
+    if ! curl -fsSL "$url" -o "$tmp_script"; then
+        error "下载失败: $url"
+        rm -f "$tmp_script" 2>/dev/null || true
+        return 1
+    fi
+
+    if [ -n "$expected_sha256" ]; then
+        local actual_sha256
+        actual_sha256=$(sha256sum "$tmp_script" 2>/dev/null | awk '{print $1}')
+        if [ -z "$actual_sha256" ] || [ "$actual_sha256" != "$expected_sha256" ]; then
+            error "SHA256 校验失败"
+            echo "期望: $expected_sha256"
+            echo "实际: ${actual_sha256:-<empty>}"
+            rm -f "$tmp_script" 2>/dev/null || true
+            return 1
+        fi
+        ok "SHA256 校验通过"
+    else
+        warn "未提供 SHA256，跳过完整性校验（不推荐）"
+    fi
+
+    if ! confirm_dangerous_action "执行远程脚本：$url" "RUN"; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        return 1
+    fi
+
+    bash "$tmp_script"
+    local rc=$?
+    rm -f "$tmp_script" 2>/dev/null || true
+    return $rc
 }
 
 # 验证数字输入
@@ -174,7 +234,7 @@ print_divider() {
 }
 
 # ---------- 常量定义 ----------
-readonly SCRIPT_VERSION="v1.0.3"
+readonly SCRIPT_VERSION="v1.0.4"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com"
 readonly QB_STATIC_REPO="userdocs/qbittorrent-nox-static"
 
@@ -961,36 +1021,26 @@ write_sources() {
 
     case $pm in
         "apt")
-            # Debian/Ubuntu
-            # 危险操作：删除系统关键目录，需要严格验证和确认
+            # Debian/Ubuntu（安全模式：不删除 /etc/apt 整目录）
             if [ ! -d "/etc/apt" ]; then
-                warn "/etc/apt 目录不存在，跳过删除步骤"
-            else
-                warn "⚠️  警告: 即将删除系统关键目录 /etc/apt"
-                warn "此操作将删除所有APT配置和源设置"
-                read -rp "确认继续? [y/N]: " confirm_apt
-                if [[ ! "$confirm_apt" =~ ^[Yy]$ ]]; then
-                    error "操作已取消"
-                    return 1
-                fi
-                
-                # 创建备份
-                local apt_backup="/tmp/etc-apt.backup.$(date +%Y%m%d_%H%M%S).tar.gz"
-                echo "📦 正在创建备份: $apt_backup"
-                if ! sudo tar -czf "$apt_backup" -C / etc/apt 2>/dev/null; then
-                    error "备份失败，操作已取消"
-                    return 1
-                fi
-                ok "备份已创建: $apt_backup"
-                
-            echo "🧹 删除旧的 /etc/apt 目录..."
-                if ! sudo rm -rf /etc/apt; then
-                    error "删除失败"
-                    return 1
-                fi
+                error "/etc/apt 目录不存在，无法继续"
+                return 1
             fi
-            echo "📂 创建必要目录..."
-            sudo mkdir -p /etc/apt/apt.conf.d /etc/apt/preferences.d /etc/apt/trusted.gpg.d
+
+            # 创建备份
+            local apt_backup="/tmp/etc-apt.backup.$(date +%Y%m%d_%H%M%S).tar.gz"
+            echo "📦 正在创建备份: $apt_backup"
+            if ! sudo tar -czf "$apt_backup" -C / etc/apt 2>/dev/null; then
+                error "备份失败，操作已取消"
+                return 1
+            fi
+            ok "备份已创建: $apt_backup"
+
+            # 安全清理：仅清理源列表，不删除关键目录结构
+            echo "🧹 安全清理旧的 APT 源配置..."
+            sudo mkdir -p /etc/apt/sources.list.d /etc/apt/apt.conf.d /etc/apt/preferences.d /etc/apt/trusted.gpg.d
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.list' -delete 2>/dev/null || true
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.sources' -delete 2>/dev/null || true
 
             echo "📝 写入新的源配置..."
             case $mirror_type in
@@ -1160,7 +1210,7 @@ manage_sources_menu() {
 
     case $choice in
       1) backup_sources "$system_info"; pause ;;
-      2) restore_backup && pause ;;
+      2) restore_backup; pause ;;
       3) write_sources "$system_info" "official"; pause ;;
       4)
         if [[ "$pm" == "apt" || "$pm" == "dnf" || "$pm" == "yum" ]]; then
@@ -1249,13 +1299,14 @@ streaming_test() {
   warn "安全警告: 即将执行远程脚本"
   echo "脚本来源: https://github.com/lmc999/RegionRestrictionCheck/raw/main/check.sh"
   echo "此操作将从互联网下载并执行脚本，请确保您信任该来源。"
-  read -rp "确认继续? [y/N]: " confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    info "操作已取消"
+  if ! confirm_dangerous_action "流媒体测试将执行远程脚本" "RUN"; then
     pause
     return
   fi
-  bash <(curl -sSL https://github.com/lmc999/RegionRestrictionCheck/raw/main/check.sh)
+
+  if ! run_remote_script_secure "https://github.com/lmc999/RegionRestrictionCheck/raw/main/check.sh" ""; then
+    error "流媒体测试执行失败"
+  fi
   pause
 }
 
@@ -1279,14 +1330,15 @@ install_dpanel() {
   echo -e "${YELLOW}此操作将从互联网下载并执行脚本，可能会修改系统配置。${NC}"
   echo -e "${YELLOW}请确保您信任该来源并已备份重要数据。${NC}"
   echo ""
-  question "确认继续安装? [y/N]: "
-  read -r confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    info "安装已取消"
+
+  if ! confirm_dangerous_action "安装 DPanel（远程脚本执行）" "RUN"; then
     pause
     return
   fi
-  bash <(curl -sSL https://raw.githubusercontent.com/Dpanel-Server/DPanel/master/install.sh)
+
+  if ! run_remote_script_secure "https://raw.githubusercontent.com/Dpanel-Server/DPanel/master/install.sh" ""; then
+    error "DPanel 安装脚本执行失败"
+  fi
   pause
 }
 
@@ -2059,10 +2111,15 @@ check_and_install_locale() {
 
 # ---------- 自定义安装 qBittorrent ----------
 install_qbittorrent_custom() {
+    # 交互安装流程局部容错，避免 set -e 导致中途退回菜单
+    set +e
+
     # 检查必要的工具
     for cmd in wget chmod mv systemctl; do
         if ! command -v "$cmd" &> /dev/null; then
             error "缺少必要的工具: $cmd"
+            pause
+            set -e
             return 1
         fi
     done
@@ -2105,6 +2162,8 @@ install_qbittorrent_custom() {
     # 验证输入
     if ! validate_number "$version_choice" 0 15; then
         error "无效输入，请输入 0-15 之间的数字"
+        pause
+        set -e
         return 1
     fi
 
@@ -2173,10 +2232,13 @@ install_qbittorrent_custom() {
             DOWNLOAD_URL="https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-4.6.3_v2.0.10/x86_64-qbittorrent-nox"
             ;;
         0)
+            set -e
             return 0
             ;;
         *)
             error "无效选择，返回主菜单"
+            pause
+            set -e
             return 1
             ;;
     esac
@@ -2190,6 +2252,8 @@ install_qbittorrent_custom() {
     else
         if ! safe_download "$DOWNLOAD_URL" "$APP_NAME" "qBittorrent $VERSION"; then
             error "请检查网络连接或手动上传二进制文件到当前目录"
+            pause
+            set -e
             return 1
         fi
     fi
@@ -2197,11 +2261,15 @@ install_qbittorrent_custom() {
     # 2. 赋予执行权限并移动
     if ! chmod +x $APP_NAME; then
         error "设置执行权限失败"
+        pause
+        set -e
         return 1
     fi
     
     if ! sudo mv $APP_NAME $INSTALL_PATH; then
         error "移动文件到 $INSTALL_PATH 失败"
+        pause
+        set -e
         return 1
     fi
     echo "[成功] 二进制文件已部署到 $INSTALL_PATH"
@@ -2210,6 +2278,8 @@ install_qbittorrent_custom() {
     CONF_DIR="/$TARGET_USER/.config/qBittorrent"
     if ! mkdir -p $CONF_DIR; then
         error "创建配置目录失败: $CONF_DIR"
+        pause
+        set -e
         return 1
     fi
 
@@ -2257,10 +2327,15 @@ EOF
     echo "   journalctl -u $APP_NAME | grep password"
     echo "-------------------------------------------------------"
     echo "⚠️  安全提示: 登录后请务必在 WebUI 设置中将密码修改为强密码！"
+    pause
+    set -e
 }
 
 # ---------- 安装 qBittorrent ----------
 install_qbittorrent() {
+    # 该函数包含较多“可能返回非0但不应中断流程”的命令，局部关闭 set -e
+    set +e
+
     CONFIG_DIR="/root/.config/qBittorrent"
     CONF_FILE="$CONFIG_DIR/qBittorrent.conf"
 
@@ -2269,7 +2344,7 @@ install_qbittorrent() {
     if command -v apt &> /dev/null; then
         info "正在查询系统仓库中的 qBittorrent 版本..."
         QB_INFO=$(apt show qbittorrent-nox 2>/dev/null | grep -E "Version|Description" | head -2)
-        if [ $? -eq 0 ] && [ -n "$QB_INFO" ]; then
+        if [ -n "$QB_INFO" ]; then
             echo "系统默认安装版本信息："
             echo "$QB_INFO"
             echo ""
@@ -2278,11 +2353,15 @@ install_qbittorrent() {
             echo ""
         fi
     else
-        echo "未检测到 apt 包管理器"
-        echo ""
+        error "未检测到 apt 包管理器，当前仅支持 Debian/Ubuntu"
+        pause
+        set -e
+        return 1
     fi
+
     info "更新系统..."
-    apt update && apt upgrade -y
+    apt update
+    apt upgrade -y
     apt install -y software-properties-common wget nano curl gnupg lsb-release
 
     info "安装 qBittorrent-nox..."
@@ -2290,32 +2369,24 @@ install_qbittorrent() {
         add-apt-repository ppa:qbittorrent-team/qbittorrent-stable -y
         apt update
     fi
-    apt install -y qbittorrent-nox
 
-    info "生成或修改配置文件..."
-    mkdir -p $CONFIG_DIR
-
-    # 判断是否已有配置文件
-    if [ -f "$CONF_FILE" ]; then
-        info "已有配置文件，更新为完整自定义配置..."
-    else
-        info "首次启动，生成配置文件..."
-        qbittorrent-nox &
-        sleep 5
-        kill $!
+    if ! apt install -y qbittorrent-nox; then
+        error "qBittorrent-nox 安装失败"
+        pause
+        set -e
+        return 1
     fi
-
 
     info "创建 systemd 服务..."
     SERVICE_FILE="/etc/systemd/system/qbittorrent.service"
-    cat > $SERVICE_FILE <<EOF
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=qBittorrent-nox service
 After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/qbittorrent-nox
+ExecStart=/usr/bin/qbittorrent-nox --profile=/root/.config/qBittorrent
 Restart=on-failure
 LimitNOFILE=10240
 
@@ -2324,13 +2395,40 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now qbittorrent
+    systemctl enable qbittorrent >/dev/null 2>&1
+    systemctl restart qbittorrent
+
+    # 等待服务输出初始密码日志
+    info "正在等待 qBittorrent 初始化（最多 30 秒）..."
+    INITIAL_PASSWORD=""
+    for i in {1..15}; do
+        INITIAL_PASSWORD=$(journalctl -u qbittorrent -n 100 --no-pager 2>/dev/null | sed -n 's/.*temporary password is provided for this session: \(.*\)$/\1/p' | tail -1)
+        if [ -n "$INITIAL_PASSWORD" ]; then
+            break
+        fi
+        sleep 2
+    done
+
+    PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me 2>/dev/null)
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="您的服务器IP"
 
     success "安装/更新完成"
-    echo -e "${BOLD_CYAN}WebUI 地址：${NC}${BOLD_GREEN}http://$(curl -s ifconfig.me):8080${NC}"
+    echo -e "${BOLD_CYAN}WebUI 地址：${NC}${BOLD_GREEN}http://$PUBLIC_IP:8080${NC}"
     echo -e "${CYAN}用户名：${NC}${BOLD_WHITE}admin${NC}"
-    warn "密码：请查看配置文件 $CONF_FILE 或首次登录后修改密码"
+
+    if [ -n "$INITIAL_PASSWORD" ]; then
+        echo -e "${CYAN}初始临时密码：${NC}${BOLD_YELLOW}$INITIAL_PASSWORD${NC}"
+    else
+        warn "未能自动提取初始密码（服务可能尚未完全启动）"
+        echo "可手动执行以下命令查看："
+        echo "journalctl -u qbittorrent -n 200 --no-pager | grep -i 'temporary password'"
+    fi
+
     echo "WebUI 已设置为中文，服务已配置开机自启。"
+    pause
+
+    # 恢复全局严格模式
+    set -e
 }
 
 # ---------- 系统环境检查 ----------
