@@ -166,70 +166,12 @@ COUNTRY=$(get_country)
 
 # ── Gemini 检测 ───────────────────────────────────────────────────────────────
 
-# 检测 Gemini 网页版是否真正解锁（检测响应体中的地区限制提示）
-check_gemini_web_unlock() {
-    local body http_code
-    body=$(curl -s -w "\n__HTTP_CODE__%{http_code}" \
-        --max-time "$TIMEOUT" --connect-timeout 6 -L \
-        -A "$UA_PC" \
-        -H "Accept-Language: en-US,en;q=0.9" \
-        "https://gemini.google.com" 2>/dev/null)
-    http_code=$(echo "$body" | grep "__HTTP_CODE__" | sed 's/.*__HTTP_CODE__//')
-    body=$(echo "$body" | grep -v "__HTTP_CODE__")
-
-    if [ "$http_code" = "000" ]; then
-        echo "blocked"
-        return
-    fi
-    # Gemini 在受限地区返回 200 但页面含地区限制文字
-    if echo "$body" | grep -qiE "not available in your country|unavailable in your country|not supported in your country|此国家|此地区无法使用|Gemini isn.t available"; then
-        echo "geo_blocked"
-        return
-    fi
-    if echo "$body" | grep -qiE "gemini|bard|google ai"; then
-        echo "ok"
-        return
-    fi
-    echo "unknown_$http_code"
-}
-
-# 检测 Gemini App 版是否真正解锁（iOS UA + /app 端点）
-check_gemini_app_unlock() {
-    local body http_code
-    body=$(curl -s -w "\n__HTTP_CODE__%{http_code}" \
-        --max-time "$TIMEOUT" --connect-timeout 6 -L \
-        -A "$UA_IOS" \
-        -H "Accept-Language: en-US,en;q=0.9" \
-        "https://gemini.google.com/app" 2>/dev/null)
-    http_code=$(echo "$body" | grep "__HTTP_CODE__" | sed 's/.*__HTTP_CODE__//')
-    body=$(echo "$body" | grep -v "__HTTP_CODE__")
-
-    if [ "$http_code" = "000" ]; then
-        echo "blocked"
-        return
-    fi
-    if echo "$body" | grep -qiE "not available in your country|unavailable in your country|not supported in your country|此国家|此地区无法使用|Gemini isn.t available"; then
-        echo "geo_blocked"
-        return
-    fi
-    if echo "$body" | grep -qiE "gemini|bard|google ai"; then
-        echo "ok"
-        return
-    fi
-    echo "unknown_$http_code"
-}
-
-# 检测 Gemini 是否真正解锁（综合网页版+App版+API）
+# 检测 Gemini 是否真正解锁（综合 API 状态码 + 响应体）
 detect_gemini_unlock() {
-    # 方法1：检测网页版响应体（最准确，直接看页面是否含地区限制文字）
-    local web_result
-    web_result=$(check_gemini_web_unlock)
-
-    # 方法2：检测 App 版响应体（iOS UA）
-    local app_result
-    app_result=$(check_gemini_app_unlock)
-
-    # 方法3：检测 Gemini API（400=key无效但服务可达，403=地区封锁，000=网络不通）
+    # 方法1：检测 Gemini API 端点
+    # 400 = key无效但服务可达（已解锁）
+    # 403 = 地区封锁
+    # 000 = 网络不通
     local api_body api_code
     api_body=$(curl -s -w "\n__HTTP_CODE__%{http_code}" \
         --max-time "$TIMEOUT" --connect-timeout 6 \
@@ -238,25 +180,53 @@ detect_gemini_unlock() {
     api_code=$(echo "$api_body" | grep "__HTTP_CODE__" | sed 's/.*__HTTP_CODE__//')
     api_body=$(echo "$api_body" | grep -v "__HTTP_CODE__")
 
-    # API 响应体中检查地区限制（403 响应体可能含 USER_LOCATION_INVALID）
+    # API 响应体检查地区限制错误码
     local api_geo_blocked=0
-    if echo "$api_body" | grep -qiE "USER_LOCATION_INVALID|not available in your country|location"; then
+    if echo "$api_body" | grep -qiE "USER_LOCATION_INVALID|SERVICE_DISABLED|location is not supported"; then
         api_geo_blocked=1
     fi
 
-    # 综合判断：优先响应体检测，其次 API 状态码
-    if [ "$web_result" = "geo_blocked" ] || [ "$app_result" = "geo_blocked" ]; then
+    # 方法2：检测 Gemini 主页，用 /faq 或 /about 等静态子页（含明文文字，不依赖 JS 渲染）
+    local faq_body faq_code
+    faq_body=$(curl -s -w "\n__HTTP_CODE__%{http_code}" \
+        --max-time "$TIMEOUT" --connect-timeout 6 -L \
+        -A "$UA_PC" \
+        -H "Accept-Language: en-US,en;q=0.9" \
+        "https://gemini.google.com/faq" 2>/dev/null)
+    faq_code=$(echo "$faq_body" | grep "__HTTP_CODE__" | sed 's/.*__HTTP_CODE__//')
+    faq_body=$(echo "$faq_body" | grep -v "__HTTP_CODE__")
+
+    # 方法3：iOS UA 访问 /app，检测是否重定向到不支持页面
+    local app_effective
+    app_effective=$(curl -s -o /dev/null -w "%{url_effective}" \
+        --max-time "$TIMEOUT" --connect-timeout 6 -L \
+        -A "$UA_IOS" \
+        "https://gemini.google.com/app" 2>/dev/null)
+
+    # 综合判断
+    # 优先级：API 地区错误 > API 403 > FAQ 页面内容 > App 跳转 > API 400/200
+    if [ "$api_geo_blocked" = "1" ]; then
         echo "在此国家/地区无法使用 ($COUNTRY)"
-    elif [ "$web_result" = "blocked" ] && [ "$app_result" = "blocked" ]; then
-        echo "网络不可达 ($COUNTRY)"
-    elif [ "$api_code" = "403" ] || [ "$api_geo_blocked" = "1" ]; then
+    elif [ "$api_code" = "403" ]; then
+        # 403 时再确认响应体，避免误判
+        if echo "$api_body" | grep -qiE "API_KEY_INVALID|PERMISSION_DENIED"; then
+            # 这是 key 权限问题，不是地区封锁
+            echo "已解锁 ($COUNTRY)"
+        else
+            echo "在此国家/地区无法使用 ($COUNTRY)"
+        fi
+    elif [ "$faq_code" != "000" ] && echo "$faq_body" | grep -qiE "not available in your (country|region)|unavailable in your (country|region)|Gemini isn.t available|not supported in your country"; then
         echo "在此国家/地区无法使用 ($COUNTRY)"
-    elif [ "$web_result" = "ok" ] || [ "$app_result" = "ok" ]; then
-        echo "已解锁 ($COUNTRY)"
+    elif echo "$app_effective" | grep -qiE "unsupported|unavailable|sorry|not-available|blocked"; then
+        echo "在此国家/地区无法使用 ($COUNTRY)"
     elif [ "$api_code" = "400" ] || [ "$api_code" = "200" ]; then
         echo "已解锁 ($COUNTRY)"
+    elif [ "$faq_code" = "200" ] || [ "$faq_code" = "301" ] || [ "$faq_code" = "302" ]; then
+        echo "已解锁 ($COUNTRY)"
+    elif [ "$api_code" = "000" ]; then
+        echo "网络不可达 ($COUNTRY)"
     else
-        echo "状态未知 ($COUNTRY)"
+        echo "状态未知 [API:$api_code] ($COUNTRY)"
     fi
 }
 
@@ -377,12 +347,12 @@ gemini_web=0
 gemini_app=0
 
 echo -e "  ${YELLOW}  网页版 (PC)${NC}"
-check_item "  gemini.google.com"                "https://gemini.google.com"           "PC"  "body_block" && gemini_web=$((gemini_web+1))
-check_item "  aistudio.google.com"              "https://aistudio.google.com"         "PC"  "body_block" && gemini_web=$((gemini_web+1))
-check_item "  gemini.google.com/app"            "https://gemini.google.com/app"       "PC"  "body_block" && gemini_web=$((gemini_web+1))
+check_item "  gemini.google.com"                "https://gemini.google.com"           "PC"  "strict" && gemini_web=$((gemini_web+1))
+check_item "  aistudio.google.com"              "https://aistudio.google.com"         "PC"  "strict" && gemini_web=$((gemini_web+1))
+check_item "  gemini.google.com/app"            "https://gemini.google.com/app"       "PC"  "strict" && gemini_web=$((gemini_web+1))
 
 echo -e "  ${YELLOW}  手机 App 版 (iOS UA)${NC}"
-check_item "  gemini.google.com (iOS)"          "https://gemini.google.com"           "iOS" "body_block" && gemini_app=$((gemini_app+1))
+check_item "  gemini.google.com (iOS)"          "https://gemini.google.com"           "iOS" "strict" && gemini_app=$((gemini_app+1))
 check_item "  googleapis API (App后端)"         "https://generativelanguage.googleapis.com/v1beta/models?key=TEST" "PC" "api400" && gemini_app=$((gemini_app+1))
 check_item "  accounts.google.com (登录)"       "https://accounts.google.com"         "iOS" "general"   && gemini_app=$((gemini_app+1))
 
