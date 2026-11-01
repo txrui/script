@@ -71,10 +71,15 @@ run_remote_script_secure() {
         return 1
     fi
 
+    # 全局 set -e 下保护下载/校验/执行过程的非零退出码
+    set +e
+    trap 'set -e' RETURN
+
     info "正在下载远程脚本..."
-    if ! curl -fsSL "$url" -o "$tmp_script"; then
+    if ! curl -fsSL "$url" -o "$tmp_script" 2>/dev/null; then
         error "下载失败: $url"
         rm -f "$tmp_script" 2>/dev/null || true
+        set -e; trap - RETURN
         return 1
     fi
 
@@ -86,6 +91,7 @@ run_remote_script_secure() {
             echo "期望: $expected_sha256"
             echo "实际: ${actual_sha256:-<empty>}"
             rm -f "$tmp_script" 2>/dev/null || true
+            set -e; trap - RETURN
             return 1
         fi
         ok "SHA256 校验通过"
@@ -95,12 +101,14 @@ run_remote_script_secure() {
 
     if ! confirm_dangerous_action "执行远程脚本：$url" "RUN"; then
         rm -f "$tmp_script" 2>/dev/null || true
+        set -e; trap - RETURN
         return 1
     fi
 
     bash "$tmp_script"
     local rc=$?
     rm -f "$tmp_script" 2>/dev/null || true
+    set -e; trap - RETURN
     return $rc
 }
 
@@ -194,8 +202,13 @@ BLINK='\033[5m' # 闪烁
 # 颜色美化函数
 print_header() {
     local title="$1"
+    # 修复：title 过长时宽度为负数会导致渲染异常；改用条件判断限定宽度≥0
+    local inner_width=60
+    local title_len=${#title}
+    local pad=$((inner_width - title_len - 2))
+    if (( pad < 0 )); then pad=0; fi
     echo -e "${BOLD_CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD_CYAN}║${NC} ${BOLD_WHITE}$title${NC} ${BOLD_CYAN}$(printf '%*s' $((60 - ${#title} - 2)) '')║${NC}"
+    echo -e "${BOLD_CYAN}║${NC} ${BOLD_WHITE}$title${NC} ${BOLD_CYAN}$(printf '%*s' "$pad" '')║${NC}"
     echo -e "${BOLD_CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
 }
 
@@ -223,6 +236,13 @@ print_option_pair() {
     local num2="$3"
     local desc2="$4"
     printf "  ${BOLD_GREEN}%2s)${NC} ${CYAN}%-25s${NC} ${BOLD_GREEN}%2s)${NC} ${CYAN}%s${NC}\n" "$num1" "$desc1" "$num2" "$desc2"
+}
+
+print_option_quad() {
+    local n1="$1" d1="$2" n2="$3" d2="$4"
+    local n3="$5" d3="$6" n4="$7" d4="$8"
+    printf "  ${BOLD_GREEN}%2s)${NC} ${CYAN}%-18s${NC} ${BOLD_GREEN}%2s)${NC} ${CYAN}%-18s${NC} ${BOLD_GREEN}%2s)${NC} ${CYAN}%-18s${NC} ${BOLD_GREEN}%2s)${NC} ${CYAN}%s${NC}\n" \
+        "$n1" "$d1" "$n2" "$d2" "$n3" "$d3" "$n4" "$d4"
 }
 
 print_separator() {
@@ -253,7 +273,8 @@ manage_swap_menu() {
     print_option "8" "自定义添加虚拟内存"
     print_option "9" "Swappiness 设定"
     print_separator
-    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回主菜单${NC}"
+    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+    echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
     print_separator
     echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
     read -r opt
@@ -285,16 +306,30 @@ manage_swap_menu() {
             rm -f "$swapdev"
             ok "已删除 swap 文件: $swapdev"
         fi
-        # 如果是分区，提示用户是否删除
+        # 如果是分区，先用 blkid 校验是否为真正的 swap 分区，避免误删数据分区
         if [[ "$swapdev" =~ ^/dev/ ]]; then
-            question "检测到 swap 分区 $swapdev。是否删除该分区? [y/N]: "
+            local fstype
+            fstype=$(blkid -s TYPE -o value "$swapdev" 2>/dev/null || echo "")
+            if [[ "$fstype" != "swap" ]]; then
+                error "跳过 $swapdev：检测到的文件系统类型是 '${fstype:-unknown}'，不是 swap 分区"
+                continue
+            fi
+            question "检测到 swap 分区 $swapdev（已验证）。是否删除该分区? [y/N]: "
             read -r yn
             yn=${yn:-N}  # 默认不删除，防止误操作
             if [[ "$yn" =~ ^[Yy]$ ]]; then
                 # 删除分区（用 sfdisk 清空分区表）
                 echo "正在删除分区 $swapdev ..."
-                parted "$swapdev" rm 1 >/dev/null 2>&1
-                ok "已删除 swap 分区 $swapdev"
+                # 修复：仅删除已确认的 swap 分区
+                local part_num
+                part_num=$(lsblk -n -o NAME "$swapdev" 2>/dev/null | awk '{print $1}' | grep -oE '[0-9]+$' | tail -1)
+                if [[ -n "$part_num" ]]; then
+                    parted "/dev/$(echo "$swapdev" | sed 's|/dev/||' | sed 's|[0-9]*$||')" rm "$part_num" >/dev/null 2>&1 && \
+                        ok "已删除 swap 分区 $swapdev" || \
+                        error "删除分区失败，请手动处理"
+                else
+                    error "无法确定 $swapdev 的分区号，跳过删除"
+                fi
             else
                 ok "保留 swap 分区 $swapdev"
             fi
@@ -307,7 +342,7 @@ manage_swap_menu() {
     ;;
 
       7)
-        grep -q '/swapfile' /etc/fstab && ok "已设置自动挂载" || warn "未检测到自动挂载"
+        check_swapfile_autostart || true
         pause ;;
       8)
         question "请输入虚拟内存大小（如 512M 或 3G）: "
@@ -320,9 +355,75 @@ manage_swap_menu() {
         fi ;;
       9) manage_swappiness ;;
       0) return ;;
+      99) exit 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
   done
+}
+
+# 检查并修复 swapfile 开机自动启用配置
+check_swapfile_autostart() {
+  clear
+  echo "=========================================="
+  echo "       检查 swapfile 开机自动启用"
+  echo "=========================================="
+  local swap_file="/swapfile"
+  local fstab="/etc/fstab"
+  if [[ ! -f "$swap_file" ]]; then
+    error "$swap_file 不存在，请先创建虚拟内存"
+    return 1
+  fi
+  if [[ ! -f "$fstab" ]]; then
+    error "$fstab 不存在，无法设置开机自动启用"
+    return 1
+  fi
+  if ! command -v swapon >/dev/null 2>&1 || ! command -v mkswap >/dev/null 2>&1; then
+    error "缺少 swapon 或 mkswap 命令"
+    return 1
+  fi
+
+  chmod 600 "$swap_file" || { error "无法设置 /swapfile 权限为 600"; return 1; }
+  if ! blkid -p -s TYPE -o value "$swap_file" 2>/dev/null | grep -qx swap; then
+    warn "/swapfile 尚未识别为有效 swap 文件，正在重新初始化"
+    if ! mkswap "$swap_file"; then
+      error "mkswap 初始化失败"
+      return 1
+    fi
+  fi
+
+  local backup="${fstab}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$fstab" "$backup" || { error "无法备份 $fstab"; return 1; }
+  local tmp_fstab
+  tmp_fstab=$(mktemp) || { error "无法创建临时 fstab 文件"; return 1; }
+  awk '
+    /^[[:space:]]*#/ { print; next }
+    NF >= 3 && $1 == "/swapfile" && $3 == "swap" { next }
+    { print }
+  ' "$fstab" > "$tmp_fstab" || { rm -f "$tmp_fstab"; error "读取 fstab 失败"; return 1; }
+  printf '/swapfile none swap sw 0 0\n' >> "$tmp_fstab"
+  if ! install -m 0644 "$tmp_fstab" "$fstab"; then
+    cp -a "$backup" "$fstab"
+    rm -f "$tmp_fstab"
+    error "更新 fstab 失败，已恢复原配置"
+    return 1
+  fi
+  rm -f "$tmp_fstab"
+
+  if ! swapon --show=NAME --noheadings | awk '{$1=$1; print}' | grep -Fxq "$swap_file"; then
+    if ! swapon "$swap_file"; then
+      cp -a "$backup" "$fstab"
+      error "swapfile 目前未启用，尝试启动失败；已恢复原 fstab，请检查内核日志和文件系统"
+      return 1
+    fi
+  fi
+  if grep -Eq '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]+sw[[:space:]]+0[[:space:]]+0([[:space:]]|$)' "$fstab"; then
+    ok "已验证 /swapfile 当前启用，且开机配置有效"
+    echo "fstab 备份：$backup"
+    swapon --show
+  else
+    error "未能确认 /swapfile 的开机配置，请检查 $fstab"
+    return 1
+  fi
 }
 
 # ---------- 添加虚拟内存函数 ----------
@@ -366,13 +467,38 @@ if ! fallocate -l "$size" /swapfile 2>/dev/null; then
     return 1
   fi
   
-  if ! grep -q '/swapfile' /etc/fstab; then
-    if ! echo '/swapfile none swap sw 0 0' >> /etc/fstab; then
-      warn "无法写入 /etc/fstab，swap 可能不会在重启后自动启用"
-    fi
+  if ! check_swapfile_fstab_entry; then
+    error "swapfile 已启用，但无法写入有效的 /etc/fstab 条目"
+    return 1
   fi
   ok "已成功添加 ${size} 虚拟内存并启用"
   pause
+}
+
+# 写入唯一且标准的 swapfile fstab 条目
+check_swapfile_fstab_entry() {
+  local fstab="/etc/fstab"
+  local backup tmp_fstab
+  if [[ ! -f "$fstab" ]]; then
+    return 1
+  fi
+  backup="${fstab}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$fstab" "$backup" || return 1
+  tmp_fstab=$(mktemp) || return 1
+  awk '
+    /^[[:space:]]*#/ { print; next }
+    NF >= 3 && $1 == "/swapfile" && $3 == "swap" { next }
+    { print }
+  ' "$fstab" > "$tmp_fstab" || { rm -f "$tmp_fstab"; return 1; }
+  printf '/swapfile none swap sw 0 0\n' >> "$tmp_fstab"
+  if ! install -m 0644 "$tmp_fstab" "$fstab"; then
+    cp -a "$backup" "$fstab"
+    rm -f "$tmp_fstab"
+    return 1
+  fi
+  rm -f "$tmp_fstab"
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+  return 0
 }
 
 # ---------- Swappiness 管理函数 ----------
@@ -403,7 +529,8 @@ manage_swappiness() {
   print_option "4" "设置为默认值 (60)"
   print_option "5" "设置为最小值 (0 - 禁用 swap 优先)"
   print_separator
-  echo -e "  ${BOLD_RED}0)${NC} ${RED}返回${NC}"
+  echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+  echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
   print_separator
   echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
   read -r opt
@@ -511,6 +638,7 @@ manage_swappiness() {
       pause
       ;;
     0) return ;;
+    99) exit 0 ;;
     *) warn "无效选项"; sleep 1 ;;
   esac
 }
@@ -587,9 +715,10 @@ deb-src http://security.debian.org/debian-security bookworm-security main contri
 EOF
         fi
     elif [[ "$distro" == "ubuntu" ]]; then
-        # Ubuntu 版本映射
+        # Ubuntu 版本映射（修复：补充 18.04/24.10/25.04/25.10 等缺失版本）
         local codename=""
         case $ver in
+            "18.04") codename="bionic" ;;
             "20.04") codename="focal" ;;
             "21.04") codename="hirsute" ;;
             "21.10") codename="impish" ;;
@@ -598,6 +727,9 @@ EOF
             "23.04") codename="lunar" ;;
             "23.10") codename="mantic" ;;
             "24.04") codename="noble" ;;
+            "24.10") codename="oracular" ;;
+            "25.04") codename="plucky" ;;
+            "25.10") codename="questing" ;;
         esac
 
         if [[ -n "$codename" ]]; then
@@ -613,6 +745,21 @@ deb-src http://archive.ubuntu.com/ubuntu/ $codename-security main restricted uni
 
 deb http://archive.ubuntu.com/ubuntu/ $codename-backports main restricted universe multiverse
 deb-src http://archive.ubuntu.com/ubuntu/ $codename-backports main restricted universe multiverse
+EOF
+        else
+            warn "未识别的 Ubuntu 版本: $ver，将使用 noble 作为兜底"
+            cat <<'EOF'
+deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+deb-src http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+
+deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+deb-src http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+
+deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+deb-src http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+
+deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
+deb-src http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
 EOF
         fi
     fi
@@ -1203,7 +1350,8 @@ manage_sources_menu() {
     esac
 
     echo ""
-    print_option_pair "7" "更新软件包列表" "0" "返回主菜单"
+    print_option_pair "7" "更新软件包列表" "0" "返回上级菜单"
+    print_option "99" "退出脚本"
     print_separator
     echo -ne "${BOLD_MAGENTA}请输入选项: ${NC}"
     read -r choice
@@ -1245,6 +1393,7 @@ manage_sources_menu() {
         pause
         ;;
       0) break ;;
+      99) exit 0 ;;
       *) warn "无效选项，请重新输入"; pause ;;
     esac
   done
@@ -1257,12 +1406,15 @@ manage_bbr() {
   print_option "1" "启用 BBR"
   print_option "2" "查看 BBR 状态"
   print_separator
-  echo -e "  ${BOLD_RED}0)${NC} ${RED}返回主菜单${NC}"
+  echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+  echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
   print_separator
   echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
   read -r opt
   case "$opt" in
     1)
+      # 修复：先去重再追加，避免重复运行产生重复条目
+      sed -i '/^net\.core\.default_qdisc=/d; /^net\.ipv4\.tcp_congestion_control=/d' /etc/sysctl.conf
       echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
       echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
       sysctl -p
@@ -1272,6 +1424,7 @@ manage_bbr() {
       sysctl net.ipv4.tcp_congestion_control
       pause ;;
     0) return ;;
+    99) exit 0 ;;
   esac
 }
 
@@ -1280,7 +1433,11 @@ optimize_bbr() {
   clear
   print_menu_header "BBR 优化"
   info "正在优化 TCP 参数..."
-  cat >> /etc/sysctl.conf <<EOF
+  # 修复：先去重再追加，避免重复运行产生重复条目
+  for key in net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.tcp_fastopen net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+    sed -i "/^${key}=/d" /etc/sysctl.conf
+  done
+  cat >> /etc/sysctl.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_fastopen=3
@@ -1314,10 +1471,31 @@ streaming_test() {
 install_bt_panel() {
   clear
   print_menu_header "安装宝塔面板"
-  info "正在下载安装脚本..."
-  wget -O install.sh http://download.bt.cn/install/install-ubuntu_6.0.sh
+
+  # 修复：宝塔对 Debian / Ubuntu / CentOS 提供不同的安装脚本；硬编码 Ubuntu 在其他系统上会失败
+  local bt_url=""
+  if [ -f /etc/redhat-release ]; then
+    bt_url="http://download.bt.cn/install/install_6.0.sh"
+  elif [ -f /etc/lsb-release ] || grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
+    bt_url="http://download.bt.cn/install/install-ubuntu_6.0.sh"
+  elif [ -f /etc/debian_version ]; then
+    bt_url="http://download.bt.cn/install/install-debian_6.0.sh"
+  else
+    bt_url="http://download.bt.cn/install/install-ubuntu_6.0.sh"
+  fi
+
+  info "正在下载安装脚本: $bt_url"
+  if ! wget -O install.sh "$bt_url"; then
+    error "下载宝塔安装脚本失败"
+    pause
+    return
+  fi
   info "正在执行安装..."
+  set +e
+  trap 'set -e' RETURN
   bash install.sh
+  set -e
+  trap - RETURN
   pause
 }
 
@@ -1803,6 +1981,7 @@ manage_firewall() {
     echo "3) 临时关闭防火墙 (不改变开机自启)"
     echo "4) 重启防火墙"
     echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     read -rp "请输入选项: " choice
 
     case $choice in
@@ -1887,6 +2066,9 @@ manage_firewall() {
       0)
         break
         ;;
+      99)
+        exit 0
+        ;;
       *)
         echo "❗ 无效选项"
         read -p "按回车继续..."
@@ -1910,8 +2092,12 @@ change_timezone() {
     echo "5) 香港 (Asia/Hong_Kong)"
     echo "6) 自定义时区"
     echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     read -rp "请选择时区: " choice
 
+    # 先重置 tz，再用 case 赋值；用 skip 标志代替 continue（在 case 中 continue 无效）
+    local tz=""
+    local skip=0
     case $choice in
       1) tz="Asia/Shanghai" ;;
       2) tz="Asia/Tokyo" ;;
@@ -1922,18 +2108,29 @@ change_timezone() {
         read -rp "请输入自定义时区 (如 Europe/London): " tz
         if ! timedatectl list-timezones | grep -q "^$tz$"; then
           error "时区无效"
-          read -p "按回车继续..."
-          continue
+          pause
+          skip=1
         fi
         ;;
       0) return ;;
-      *) error "无效选项"; pause ; continue ;;
+      99) exit 0 ;;
+      *) error "无效选项"; pause; skip=1 ;;
     esac
+
+    # 跳过本轮剩余动作（用于替代 case 中的 continue）
+    [[ $skip -eq 1 ]] && continue
+
+    # tz 必须非空才执行
+    if [[ -z "$tz" ]]; then
+      error "未选择时区"
+      pause
+      continue
+    fi
 
     sudo timedatectl set-timezone "$tz"
     success "时区已修改为 $tz"
-    read -p "按回车继续..."
-    break
+    pause
+    return
   done
 }
 
@@ -1984,6 +2181,7 @@ change_language() {
     echo "【其他选项】"
     echo "11) 自定义语言"
     echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "----------------------------------"
     read -rp "请选择语言: " choice
 
@@ -2009,6 +2207,7 @@ change_language() {
         lang_desc="自定义语言 ($lang)"
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) error "无效选项"; pause ; continue ;;
     esac
 
@@ -2155,12 +2354,20 @@ install_qbittorrent_custom() {
     echo "14) v4.6.4"
     echo "15) v4.6.3"
     echo ""
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "-------------------------------------------------------"
     read -p "请选择版本 [1-15, 0=返回]: " version_choice
 
-    # 验证输入
-    if ! validate_number "$version_choice" 0 15; then
+    # 99 在所有菜单中统一表示退出脚本
+    if [[ "$version_choice" == "99" ]]; then
+        exit 0
+    fi
+    if [[ "$version_choice" == "0" ]]; then
+        set -e
+        return 0
+    fi
+    if ! validate_number "$version_choice" 1 15; then
         error "无效输入，请输入 0-15 之间的数字"
         pause
         set -e
@@ -2259,14 +2466,14 @@ install_qbittorrent_custom() {
     fi
 
     # 2. 赋予执行权限并移动
-    if ! chmod +x $APP_NAME; then
+    if ! chmod +x "$APP_NAME"; then
         error "设置执行权限失败"
         pause
         set -e
         return 1
     fi
-    
-    if ! sudo mv $APP_NAME $INSTALL_PATH; then
+
+    if ! sudo mv "$APP_NAME" "$INSTALL_PATH"; then
         error "移动文件到 $INSTALL_PATH 失败"
         pause
         set -e
@@ -2276,7 +2483,7 @@ install_qbittorrent_custom() {
 
     # 3. 预创建配置目录
     CONF_DIR="/$TARGET_USER/.config/qBittorrent"
-    if ! mkdir -p $CONF_DIR; then
+    if ! mkdir -p "$CONF_DIR"; then
         error "创建配置目录失败: $CONF_DIR"
         pause
         set -e
@@ -2284,8 +2491,9 @@ install_qbittorrent_custom() {
     fi
 
     # 写入基础配置（接受协议并设置端口）
+    # 修复：使用 'EOF' 引号避免反斜杠转义被解释
     if [ ! -f "$CONF_DIR/qBittorrent.conf" ]; then
-        cat <<EOF > $CONF_DIR/qBittorrent.conf
+        cat <<'EOF' > "$CONF_DIR/qBittorrent.conf"
 [LegalNotice]
 Accepted=true
 
@@ -2297,8 +2505,8 @@ EOF
         echo "[配置] 已初始化基础配置文件。"
     fi
 
-    # 4. 创建 Systemd 服务
-    cat <<EOF | sudo tee /etc/systemd/system/$APP_NAME.service
+    # 4. 创建 Systemd 服务（用 heredoc 变量插值，但路径和用户名用变量）
+    sudo tee /etc/systemd/system/$APP_NAME.service > /dev/null <<EOF
 [Unit]
 Description=qBittorrent Command Line Client
 After=network.target
@@ -2315,8 +2523,8 @@ EOF
 
     # 5. 启动服务
     sudo systemctl daemon-reload
-    sudo systemctl enable $APP_NAME
-    sudo systemctl start $APP_NAME
+    sudo systemctl enable "$APP_NAME"
+    sudo systemctl start "$APP_NAME"
 
     echo "-------------------------------------------------------"
     echo "安装完成！"
@@ -2335,6 +2543,7 @@ EOF
 install_qbittorrent() {
     # 该函数包含较多“可能返回非0但不应中断流程”的命令，局部关闭 set -e
     set +e
+    trap 'set -e' RETURN
 
     CONFIG_DIR="/root/.config/qBittorrent"
     CONF_FILE="$CONFIG_DIR/qBittorrent.conf"
@@ -2465,6 +2674,8 @@ check_system() {
 
 # ---------- 主菜单 ----------
 main_menu() {
+# 局部化变量，避免污染全局（修复：未声明 local 会污染其他函数）
+local OS_VERSION CPU_CORES MEM_TOTAL_MB MEM_TOTAL SWAP_TOTAL_MB SWAP_TOTAL DISK_TOTAL
 while true; do
     clear
     # 获取系统版本信息，只显示类似 "Ubuntu 22.04.5 LTS"
@@ -2510,39 +2721,36 @@ while true; do
     echo -e "${BOLD_CYAN}║${NC} ${CYAN}系统配置：${BOLD_GREEN}$CPU_CORES核${NC}  ${BOLD_BLUE}$MEM_TOTAL内存${NC}  ${BOLD_MAGENTA}$DISK_TOTAL存储${NC}  ${BOLD_YELLOW}$SWAP_TOTAL虚拟内存${NC} ${BOLD_CYAN}║${NC}"
     echo -e "${BOLD_CYAN}╚═══════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    print_section "系统优化"
-    print_option_pair "1" "虚拟内存管理" "2" "镜像源管理"
+    print_section "系统优化与维护"
+    print_option_quad "1" "虚拟内存管理" "2" "镜像源管理" "7" "系统清理" "8" "系统管理"
+    print_option_quad "39" "修改Swappiness" "40" "apt基础工具" "41" "yum基础工具" "55" "用户管理"
     echo ""
-    print_section "应用安装"
-    print_option_pair "3" "流媒体测试" "4" "安装宝塔面板"
-    print_option_pair "5" "安装 DPanel 面板" "6" "服务器详细信息"
+    print_section "应用与面板"
+    print_option_quad "3" "流媒体测试" "4" "宝塔面板" "5" "DPanel面板" "6" "服务器信息"
+    print_option_quad "23" "CasaOS面板" "26" "哪吒面板" "27" "3x-ui面板" "28" "h-ui面板"
+    print_option_quad "29" "s-ui面板" "30" "MCSManager" "9" "默认版QB" "10" "自选版本QB"
     echo ""
-    print_section "系统维护"
-    print_option_pair "7" "一键清理日志和缓存" "8" "系统管理"
+    print_section "系统与安全工具"
+    print_option_quad "11" "SSH密钥管理" "12" "网络诊断" "13" "DNS配置" "14" "Docker管理"
+    print_option_quad "15" "数据库管理" "16" "Python管理" "17" "Fail2Ban" "18" "SSL证书助手"
+    print_option_quad "20" "SSH端口修改" "21" "ICMP响应控制" "22" "NTP时间同步" "42" "关闭宝塔SSL"
     echo ""
-    print_section "下载工具"
-    print_option_pair "9" "安装系统默认版本QB" "10" "选择安装版本QB"
+    print_section "网络优化与测试"
+    print_option_quad "19" "GitHub加速" "24" "TCPX BBR优化" "25" "BBR优化脚本" "31" "三网回程延迟"
+    print_option_quad "32" "三网回程线路" "33" "三网测速" "34" "IP质量检测" "-" ""
     echo ""
-    print_section "系统工具"
-    print_option_pair "11" "SSH密钥管理" "12" "网络诊断工具"
-    print_option_pair "13" "DNS配置管理" "14" "Docker管理"
-    print_option_pair "15" "数据库管理" "16" "Python环境管理"
+    print_section "磁盘、共享与文件工具"
+    print_option_quad "35" "安装Rclone" "37" "NFS客户端" "38" "目录占用" "53" "SMB共享管理"
+    print_option_quad "54" "硬盘管理" "36" "端口转发" "-" "" "-" ""
     echo ""
-    print_section "安全工具"
-    print_option_pair "17" "Fail2Ban管理" "18" "SSL证书助手"
-    echo ""
-    print_section "网络增强"
-    print_option_pair "19" "GitHub加速" "20" "SSH端口修改"
-    print_option_pair "21" "ICMP响应控制" "22" "NTP时间同步"
-    echo ""
-    print_section "面板工具"
-    print_option "23" "CasaOS面板"
-    echo ""
-    print_section "快捷工具"
-    print_option "24" "快捷工具菜单（BBR/面板/网络测试/群辉/PVE等）"
+    print_section "群晖与 PVE"
+    print_option_quad "43" "群晖状态" "44" "群晖硬盘温度" "45" "群晖目录权限" "46" "群晖修改root密码"
+    print_option_quad "47" "群晖数据块32768" "48" "恢复数据块4096" "49" "群晖超级权限" "50" "PVE一键命令"
+    print_option_quad "51" "PVE磁盘目录" "52" "DD重装系统" "-" "" "-" ""
     echo ""
     print_separator
-    echo -e "  ${BOLD_RED}0)${NC} ${RED}退出${NC}"
+    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+    echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
     print_separator
     echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
     read -r choice
@@ -2564,7 +2772,8 @@ while true; do
     print_option "4" "修改 Host"
     print_option "5" "切换系统语言"
     print_separator
-    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回主菜单${NC}"
+    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+    echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
     print_separator
     echo -ne "${BOLD_MAGENTA}请输入选项: ${NC}"
     read -r sys_choice
@@ -2575,6 +2784,7 @@ while true; do
       4) edit_hosts ;;
       5) change_language ;;
       0) break ;;
+      99) exit 0 ;;
       *) echo "❗ 无效选项"; read -p "按回车继续..." ;;
     esac
   done
@@ -2601,51 +2811,183 @@ while true; do
       21) icmp_control ;;
       22) ntp_sync ;;
       23) casaos_panel ;;
-      24) quick_tools_menu ;;
-      0) ok "退出脚本"; exit 0 ;;
+      24) install_tcpx_bbr ;;
+      25) install_bbr_optimize ;;
+      26) install_nezha ;;
+      27) install_3xui ;;
+      28) install_hui ;;
+      29) install_sui ;;
+      30) install_mcsmanager ;;
+      31) test_besttrace ;;
+      32) test_mtr_trace ;;
+      33) test_superspeed ;;
+      34) test_ip_quality ;;
+      35) install_rclone ;;
+      36) install_natcfg ;;
+      37) install_nfs_client ;;
+      38) show_directory_usage ;;
+      39) modify_swappiness ;;
+      40) install_apt_tools ;;
+      41) install_yum_tools ;;
+      42) disable_bt_ssl ;;
+      43) synology_status ;;
+      44) synology_disk_temp ;;
+      45) synology_dir_permissions ;;
+      46) synology_change_root_pwd ;;
+      47) synology_set_stripe_32768 ;;
+      48) synology_set_stripe_4096 ;;
+      49) synology_super_permission ;;
+      50) install_pve_source ;;
+      51) enter_pve_images ;;
+      52) dd_reinstall ;;
+      53) samba_share_menu ;;
+      54) disk_management_menu ;;
+      55) user_management_menu ;;
+      0) ok "返回上级菜单"; return ;;
+      99) ok "退出脚本"; exit 0 ;;
       *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- 用户管理 ----------
+user_management_menu() {
+  while true; do
+    clear
+    echo "=========================================="
+    echo "              用户管理"
+    echo "=========================================="
+    echo "1) 查看普通用户"
+    echo "2) 创建用户"
+    echo "3) 修改用户密码"
+    echo "4) 锁定用户"
+    echo "5) 解锁用户"
+    echo "6) 删除用户及主目录"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
+    read -rp "请选择: " choice
+    case "$choice" in
+      1)
+        echo "普通用户列表："
+        awk -F: '$3 >= 1000 && $3 != 65534 { printf "%-20s UID=%-6s HOME=%s SHELL=%s\n", $1, $3, $6, $7 }' /etc/passwd
+        pause
+        ;;
+      2)
+        read -rp "请输入新用户名（字母、数字、下划线、短横线）: " user_name
+        if [[ ! "$user_name" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+          error "用户名格式无效"
+        elif id "$user_name" >/dev/null 2>&1; then
+          error "用户已存在"
+        elif useradd -m -s /bin/bash "$user_name"; then
+          if passwd "$user_name"; then
+            ok "用户 $user_name 创建成功"
+          else
+            warn "用户已创建，但密码设置失败"
+          fi
+        else
+          error "创建用户失败"
+        fi
+        pause
+        ;;
+      3)
+        read -rp "请输入要修改密码的用户名: " user_name
+        if id "$user_name" >/dev/null 2>&1 && passwd "$user_name"; then
+          ok "用户密码修改完成"
+        else
+          error "用户不存在或密码修改失败"
+        fi
+        pause
+        ;;
+      4|5)
+        read -rp "请输入用户名称: " user_name
+        if [[ "$user_name" == "root" || "$user_name" == "" ]] || ! id "$user_name" >/dev/null 2>&1; then
+          error "不允许锁定 root，或用户不存在"
+        elif [[ "$choice" == "4" ]] && usermod -L "$user_name"; then
+          ok "用户 $user_name 已锁定"
+        elif [[ "$choice" == "5" ]] && usermod -U "$user_name"; then
+          ok "用户 $user_name 已解锁"
+        else
+          error "用户状态修改失败"
+        fi
+        pause
+        ;;
+      6)
+        read -rp "请输入要删除的用户名: " user_name
+        if [[ "$user_name" == "root" || "$user_name" == "" ]] || ! id "$user_name" >/dev/null 2>&1; then
+          error "不允许删除 root，或用户不存在"
+        else
+          warn "这将删除用户 $user_name 及其主目录，数据无法恢复。"
+          read -rp "请输入用户名 $user_name 确认删除: " confirm
+          if [[ "$confirm" == "$user_name" ]] && userdel -r "$user_name"; then
+            ok "用户 $user_name 已删除"
+          else
+            info "操作已取消或删除失败"
+          fi
+        fi
+        pause
+        ;;
+      0) return ;;
+      99) exit 0 ;;
+      *) error "无效选项"; pause ;;
     esac
   done
 }
 
 # ---------- SSH密钥管理 ----------
 ssh_key_management() {
+  # 修复：在 sudo 场景下使用真实用户的 HOME
+  local ssh_home
+  if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    ssh_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  else
+    ssh_home="$HOME"
+  fi
   while true; do
     clear
     echo "=========================================="
     echo "         SSH 密钥管理"
     echo "=========================================="
+    echo "操作目录: $ssh_home/.ssh"
     echo "1) 生成新的 SSH 密钥对"
     echo "2) 查看现有的 SSH 密钥"
     echo "3) 导入 SSH 公钥到 authorized_keys"
     echo "4) 导出 SSH 公钥"
     echo "5) 删除 SSH 密钥"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
+    # 用 skip 标志替代 case 中的 continue
+    local skip=0
     case $choice in
       1)
         echo "生成新的 SSH 密钥对..."
         read -rp "请输入密钥文件名 (默认: id_rsa): " key_name
         key_name=${key_name:-id_rsa}
-        key_path="$HOME/.ssh/$key_name"
+        key_path="$ssh_home/.ssh/$key_name"
 
         if [ -f "$key_path" ]; then
           read -rp "密钥已存在，是否覆盖? (y/N): " overwrite
-          [[ $overwrite =~ ^[Yy]$ ]] || continue
+          if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+            skip=1
+          fi
         fi
 
-        ssh-keygen -t rsa -b 4096 -f "$key_path" -N ""
-        success "SSH 密钥对已生成:"
-        echo "私钥: $key_path"
-        echo "公钥: ${key_path}.pub"
+        if [ $skip -eq 0 ]; then
+          mkdir -p "$ssh_home/.ssh"
+          chmod 700 "$ssh_home/.ssh"
+          ssh-keygen -t rsa -b 4096 -f "$key_path" -N ""
+          success "SSH 密钥对已生成:"
+          echo "私钥: $key_path"
+          echo "公钥: ${key_path}.pub"
+        fi
         pause
         ;;
       2)
         echo "现有的 SSH 密钥:"
-        if [ -d "$HOME/.ssh" ]; then
-          ls -la "$HOME/.ssh"/id_* 2>/dev/null || echo "未找到 SSH 密钥文件"
+        if [ -d "$ssh_home/.ssh" ]; then
+          ls -la "$ssh_home/.ssh"/id_* 2>/dev/null || echo "未找到 SSH 密钥文件"
         else
           echo "SSH 目录不存在"
         fi
@@ -2655,23 +2997,23 @@ ssh_key_management() {
         echo "导入 SSH 公钥到 authorized_keys..."
         read -rp "请输入公钥文件路径或内容: " pubkey_input
 
-        mkdir -p "$HOME/.ssh"
-        chmod 700 "$HOME/.ssh"
+        mkdir -p "$ssh_home/.ssh"
+        chmod 700 "$ssh_home/.ssh"
 
         if [ -f "$pubkey_input" ]; then
-          cat "$pubkey_input" >> "$HOME/.ssh/authorized_keys"
+          cat "$pubkey_input" >> "$ssh_home/.ssh/authorized_keys"
         else
-          echo "$pubkey_input" >> "$HOME/.ssh/authorized_keys"
+          echo "$pubkey_input" >> "$ssh_home/.ssh/authorized_keys"
         fi
 
-        chmod 600 "$HOME/.ssh/authorized_keys"
+        chmod 600 "$ssh_home/.ssh/authorized_keys"
         success "公钥已导入到 authorized_keys"
         pause
         ;;
       4)
         echo "导出 SSH 公钥..."
-        if [ -d "$HOME/.ssh" ]; then
-          pubkeys=$(ls "$HOME/.ssh"/id_*.pub 2>/dev/null)
+        if [ -d "$ssh_home/.ssh" ]; then
+          pubkeys=$(ls "$ssh_home/.ssh"/id_*.pub 2>/dev/null)
           if [ -n "$pubkeys" ]; then
             echo "找到的公钥文件:"
             echo "$pubkeys"
@@ -2692,13 +3034,13 @@ ssh_key_management() {
         ;;
       5)
         echo "删除 SSH 密钥..."
-        if [ -d "$HOME/.ssh" ]; then
+        if [ -d "$ssh_home/.ssh" ]; then
           echo "现有的密钥文件:"
-          ls -la "$HOME/.ssh"/id_* 2>/dev/null || echo "未找到密钥文件"
+          ls -la "$ssh_home/.ssh"/id_* 2>/dev/null || echo "未找到密钥文件"
           echo ""
           read -rp "请输入要删除的密钥文件名 (如 id_rsa): " key_to_delete
-          if [ -n "$key_to_delete" ] && [ -f "$HOME/.ssh/$key_to_delete" ]; then
-            rm -f "$HOME/.ssh/$key_to_delete" "$HOME/.ssh/${key_to_delete}.pub"
+          if [ -n "$key_to_delete" ] && [ -f "$ssh_home/.ssh/$key_to_delete" ]; then
+            rm -f "$ssh_home/.ssh/$key_to_delete" "$ssh_home/.ssh/${key_to_delete}.pub"
             success "已删除密钥: $key_to_delete"
           else
             error "密钥文件不存在"
@@ -2709,6 +3051,7 @@ ssh_key_management() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -2726,7 +3069,8 @@ network_diagnostics() {
     print_option "5" "网络速度测试"
     print_option "6" "查看网络连接"
     print_separator
-    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回主菜单${NC}"
+    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+    echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
     print_separator
     echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
     read -r choice
@@ -2798,10 +3142,19 @@ network_diagnostics() {
         echo -e "${BOLD_CYAN}当前网络连接:${NC}"
         print_separator
         echo -e "${BOLD_CYAN}网络连接统计:${NC}"
-        netstat -tuln 2>/dev/null | wc -l | xargs -I {} echo -e "${CYAN}活动连接数:${NC} ${BOLD_GREEN}{}${NC}"
+        # 修复：优先使用 ss（iproute2），回退到 netstat
+        if command -v ss &> /dev/null; then
+          ss -tuln 2>/dev/null | wc -l | xargs -I {} echo -e "${CYAN}活动连接数:${NC} ${BOLD_GREEN}{}${NC}"
+        else
+          netstat -tuln 2>/dev/null | wc -l | xargs -I {} echo -e "${CYAN}活动连接数:${NC} ${BOLD_GREEN}{}${NC}"
+        fi
         echo ""
         echo -e "${BOLD_CYAN}监听端口:${NC}"
-        netstat -tlnp 2>/dev/null | head -10
+        if command -v ss &> /dev/null; then
+          ss -tlnp 2>/dev/null | head -10
+        else
+          netstat -tlnp 2>/dev/null | head -10
+        fi
         echo ""
         echo -e "${BOLD_CYAN}网络接口流量:${NC}"
         if command -v ip &> /dev/null; then
@@ -2810,6 +3163,7 @@ network_diagnostics() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) error "无效选项"; pause ;;
     esac
   done
@@ -2839,7 +3193,8 @@ dns_management() {
     print_option "6" "自定义 DNS"
     print_option "7" "恢复默认 DNS"
     print_separator
-    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回主菜单${NC}"
+    echo -e "  ${BOLD_RED}0)${NC} ${RED}返回上级菜单${NC}"
+    echo -e "  ${BOLD_RED}99)${NC} ${RED}退出脚本${NC}"
     print_separator
     echo -ne "${BOLD_MAGENTA}请选择: ${NC}"
     read -r choice
@@ -2891,6 +3246,7 @@ dns_management() {
         fi
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
 
@@ -2954,7 +3310,8 @@ docker_management() {
     echo "8) Docker 清理工具"
     echo "9) 查看运行中的容器"
     echo "10) 查看所有容器"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -2964,7 +3321,7 @@ docker_management() {
         if command -v docker &> /dev/null; then
           echo "Docker 已经安装"
         else
-          # 检测系统类型并安装 Docker
+          # 修复：增加 Fedora / openSUSE / Arch 的安装支持
           if [ -f /etc/debian_version ]; then
             apt update
             apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
@@ -2976,11 +3333,30 @@ docker_management() {
             yum install -y yum-utils
             yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
             yum install -y docker-ce docker-ce-cli containerd.io
+          elif [ -f /etc/fedora-release ]; then
+            dnf -y install dnf-plugins-core
+            dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+            dnf -y install docker-ce docker-ce-cli containerd.io
+          elif [ -f /etc/os-release ] && grep -q "^ID=opensuse" /etc/os-release; then
+            zypper refresh
+            zypper install -y docker docker-compose
+          elif [ -f /etc/arch-release ]; then
+            pacman -Sy --noconfirm docker
+          else
+            error "未识别的发行版，请手动安装 Docker"
+            pause
+            return
           fi
 
-          systemctl enable docker
-          systemctl start docker
-          usermod -aG docker $USER 2>/dev/null || true
+          systemctl enable docker 2>/dev/null
+          systemctl start docker 2>/dev/null
+          # 修复：使用 SUDO_USER（如果有），以便非 root 用户也能加入 docker 组
+          local target_user="${SUDO_USER:-$USER}"
+          if [ "$target_user" != "root" ] && id "$target_user" &>/dev/null; then
+            usermod -aG docker "$target_user"
+            echo "✅ 已将用户 $target_user 加入 docker 组"
+            echo "⚠️  请重新登录以使 docker 组生效"
+          fi
           echo "✅ Docker 安装完成"
         fi
         pause
@@ -3071,6 +3447,7 @@ EOF
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3113,7 +3490,8 @@ database_management() {
     echo "7) MySQL 数据库恢复"
     echo "8) PostgreSQL 数据库恢复"
     echo "9) 查看数据库状态"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -3126,6 +3504,8 @@ database_management() {
           if [ -f /etc/debian_version ]; then
             apt update
             apt install -y mysql-server
+            # 注意：Debian 12+ 默认安装的是 MariaDB（MySQL 的兼容替代品），接口完全兼容
+            echo "ℹ️  注意：Debian 12+ 系统将安装 MariaDB（MySQL 兼容替代品），接口完全兼容"
           elif [ -f /etc/redhat-release ]; then
             yum install -y mysql-server
           fi
@@ -3273,6 +3653,7 @@ database_management() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3315,7 +3696,8 @@ python_management() {
     echo "7) 配置 pip 源"
     echo "8) 清理 Python 缓存"
     echo "9) 查看已安装的包"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -3409,14 +3791,19 @@ python_management() {
         ;;
       7)
         echo "配置 pip 源..."
-        mkdir -p ~/.pip
-        cat > ~/.pip/pip.conf << EOF
+        # 修复：新版 pip 默认路径是 ~/.config/pip/pip.conf；同时写一份到旧路径 ~/.pip/pip.conf 保证兼容
+        mkdir -p ~/.config/pip ~/.pip
+        cat > ~/.config/pip/pip.conf <<'EOF'
 [global]
 index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+extra-index-url = https://mirrors.aliyun.com/pypi/simple
 [install]
-trusted-host = https://pypi.tuna.tsinghua.edu.cn
+trusted-host = pypi.tuna.tsinghua.edu.cn
+               mirrors.aliyun.com
 EOF
-        echo "✅ pip 源已配置为清华大学镜像"
+        # 兼容旧版 pip
+        cp ~/.config/pip/pip.conf ~/.pip/pip.conf
+        echo "✅ pip 源已配置为清华+阿里云镜像（~/.config/pip/pip.conf）"
         pause
         ;;
       8)
@@ -3445,6 +3832,7 @@ EOF
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3476,7 +3864,8 @@ fail2ban_management() {
     echo "7) 查看封禁列表"
     echo "8) 解禁IP"
     echo "9) 配置SSH防护"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -3550,8 +3939,13 @@ fail2ban_management() {
         ;;
       9)
         echo "配置SSH防护..."
-        # 创建自定义的jail配置
-        cat > /etc/fail2ban/jail.d/sshd-custom.conf << EOF
+        # 修复：使用带引号的 'EOF' 避免反斜杠被 bash 解释
+        # 修复：根据发行版选择正确的 SSH 日志路径（RHEL/CentOS 为 /var/log/secure）
+        local ssh_logpath="/var/log/auth.log"
+        if [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+            ssh_logpath="/var/log/secure"
+        fi
+        cat > /etc/fail2ban/jail.d/sshd-custom.conf <<'EOF'
 [sshd]
 enabled = true
 port = ssh
@@ -3561,12 +3955,15 @@ maxretry = 3
 bantime = 3600
 findtime = 600
 EOF
+        # 把占位符替换为实际路径（带引号的 EOF 不会做变量替换）
+        sed -i "s|logpath = /var/log/auth.log|logpath = ${ssh_logpath}|" /etc/fail2ban/jail.d/sshd-custom.conf
         systemctl restart fail2ban
         echo "✅ SSH防护配置已更新"
         echo "封禁规则: 10分钟内失败3次，封禁1小时"
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3601,7 +3998,8 @@ ssl_certificate_helper() {
     echo "5) 续签所有证书"
     echo "6) 查看证书状态"
     echo "7) 删除证书"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -3744,6 +4142,7 @@ ssl_certificate_helper() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3767,7 +4166,8 @@ github_acceleration() {
     echo "4) 配置 SSH 密钥认证"
     echo "5) 查看当前配置"
     echo "6) 恢复默认配置"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -3777,31 +4177,53 @@ github_acceleration() {
         # 备份当前hosts
         cp /etc/hosts /etc/hosts.backup.$(date +%Y%m%d_%H%M%S)
 
-        # 添加GitHub的IP映射
-        cat >> /etc/hosts << 'EOF'
+        # 修复：通过 GitHub 官方 API 动态获取 IP，避免硬编码失效
+        # https://docs.github.com/en/rest/meta
+        local github_ip=""
+        local fastly_ip=""
+        local meta_json
+        if meta_json=$(curl -fsSL --max-time 10 https://api.github.com/meta 2>/dev/null); then
+          # 从 JSON 提取 gitHub IP（v4 + v6）以及 web/hooks/proxy 段
+          github_ip=$(echo "$meta_json" | grep -oE '"git":[^\]]*"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)' | grep -oE '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)' | head -1)
+          # web/hooks 等用同一个 IP（GitHub 通常同段）
+          if [ -z "$github_ip" ]; then
+            github_ip=$(echo "$meta_json" | grep -oE '"[a-z_]+":\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+          fi
+          # raw.githubusercontent.com 通常跟主站
+          if [ -z "$github_ip" ]; then
+            github_ip=$(echo "$meta_json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          fi
+        fi
 
-# GitHub Hosts 加速
-140.82.112.3 github.com
-140.82.112.3 www.github.com
-185.199.108.153 assets-cdn.github.com
-185.199.108.153 github.global.ssl.fastly.net
-199.232.68.133 raw.githubusercontent.com
-199.232.68.133 gist.githubusercontent.com
-199.232.68.133 cloud.githubusercontent.com
-199.232.68.133 camo.githubusercontent.com
-199.232.68.133 avatars.githubusercontent.com
-199.232.68.133 avatars0.githubusercontent.com
-199.232.68.133 avatars1.githubusercontent.com
-199.232.68.133 avatars2.githubusercontent.com
-199.232.68.133 avatars3.githubusercontent.com
-199.232.68.133 avatars4.githubusercontent.com
-199.232.68.133 avatars5.githubusercontent.com
-199.232.68.133 avatars6.githubusercontent.com
-199.232.68.133 avatars7.githubusercontent.com
-199.232.68.133 avatars8.githubusercontent.com
+        # 兜底：使用内置稳定 IP（已知长期可用）
+        [ -z "$github_ip" ] && github_ip="140.82.112.3"
+        [ -z "$fastly_ip" ] && fastly_ip="185.199.108.153"
+
+        # 写 hosts（带引号的 EOF 防止反斜杠/变量被解释）
+        cat >> /etc/hosts <<EOF
+
+# GitHub Hosts 加速 (txrui.sh - 自动获取于 $(date '+%Y-%m-%d %H:%M'))
+${github_ip} github.com
+${github_ip} www.github.com
+${fastly_ip} assets-cdn.github.com
+${fastly_ip} github.global.ssl.fastly.net
+${github_ip} raw.githubusercontent.com
+${github_ip} gist.githubusercontent.com
+${github_ip} cloud.githubusercontent.com
+${github_ip} camo.githubusercontent.com
+${github_ip} avatars.githubusercontent.com
+${github_ip} avatars0.githubusercontent.com
+${github_ip} avatars1.githubusercontent.com
+${github_ip} avatars2.githubusercontent.com
+${github_ip} avatars3.githubusercontent.com
+${github_ip} avatars4.githubusercontent.com
+${github_ip} avatars5.githubusercontent.com
+${github_ip} avatars6.githubusercontent.com
+${github_ip} avatars7.githubusercontent.com
+${github_ip} avatars8.githubusercontent.com
 EOF
-        echo "✅ GitHub Hosts 加速配置完成"
-        echo "注意: IP地址可能随时间变化，如访问异常请更新"
+        echo "✅ GitHub Hosts 加速配置完成（IP: ${github_ip}）"
+        echo "⚠️  注意: GitHub IP 会周期性变化，若访问异常请重新执行本菜单"
         pause
         ;;
       2)
@@ -3903,6 +4325,7 @@ EOF
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -3915,7 +4338,9 @@ ssh_port_modification() {
   echo "         SSH 端口修改工具"
   echo "=========================================="
 
-  current_port=$(grep "^Port" /etc/ssh/sshd_config | awk '{print $2}' || echo "22")
+  # 修复：正确处理 Port 被注释（默认）的场景，使用 head -1 防止多行匹配
+  current_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
+  [ -z "$current_port" ] && current_port=22
   echo "当前 SSH 端口: $current_port"
   echo ""
 
@@ -3928,8 +4353,9 @@ ssh_port_modification() {
     return
   fi
 
-  # 检查端口是否被占用
-  if netstat -tln 2>/dev/null | grep ":$new_port " > /dev/null; then
+  # 检查端口是否被占用（优先 ss，回退 netstat）
+  if (command -v ss &> /dev/null && ss -tln 2>/dev/null | grep -E "[:.]${new_port}\s") >/dev/null || \
+     (command -v netstat &> /dev/null && netstat -tln 2>/dev/null | grep ":$new_port " > /dev/null); then
     echo "❌ 端口 $new_port 已被占用"
     pause
     return
@@ -3995,7 +4421,8 @@ icmp_control() {
     echo "3) 临时开启 (仅当前会话)"
     echo "4) 临时关闭 (仅当前会话)"
     echo "5) 查看 ICMP 相关设置"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -4040,6 +4467,7 @@ icmp_control() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -4070,7 +4498,8 @@ ntp_sync() {
     echo "5) 配置 NTP 服务器"
     echo "6) 查看时间状态"
     echo "7) 手动设置时间"
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "------------------------------------------"
     read -rp "请选择: " choice
 
@@ -4146,17 +4575,31 @@ ntp_sync() {
           *) echo "❌ 无效选择"; return ;;
         esac
 
-        # 配置NTP服务器
-        if [ -f /etc/ntp.conf ]; then
-          sed -i 's/^server.*/server '"$ntp_server"' iburst/g' /etc/ntp.conf
-          echo "restrict default kod nomodify notrap nopeer noquery" >> /etc/ntp.conf
-          echo "restrict -6 default kod nomodify notrap nopeer noquery" >> /etc/ntp.conf
+        # 修复：现代 Ubuntu/Debian 默认使用 systemd-timesyncd 而非 ntpd
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+          # 配置 systemd-timesyncd
+          mkdir -p /etc/systemd/timesyncd.conf.d
+          cat > /etc/systemd/timesyncd.conf.d/txrui.conf <<EOF
+[Time]
+NTP=${ntp_server}
+FallbackNTP=pool.ntp.org
+EOF
+          systemctl restart systemd-timesyncd
+          timedatectl set-ntp true
+          echo "✅ systemd-timesyncd 已配置为: $ntp_server"
+        elif [ -f /etc/ntp.conf ]; then
+          # 配置 ntp.conf（使用 sed 去重避免重复 server 行）
+          sed -i '/^server /d' /etc/ntp.conf
+          echo "server ${ntp_server} iburst" >> /etc/ntp.conf
+          if ! grep -q "^restrict default" /etc/ntp.conf; then
+            echo "restrict default kod nomodify notrap nopeer noquery" >> /etc/ntp.conf
+            echo "restrict -6 default kod nomodify notrap nopeer noquery" >> /etc/ntp.conf
+          fi
+          systemctl restart ntpd 2>/dev/null || systemctl restart ntp 2>/dev/null || true
+          echo "✅ NTP 服务器已配置为: $ntp_server"
+        else
+          warn "未检测到 ntpd 或 systemd-timesyncd，请先安装"
         fi
-
-        # 重启NTP服务
-        systemctl restart ntpd 2>/dev/null || systemctl restart ntp 2>/dev/null || true
-
-        echo "✅ NTP 服务器已配置为: $ntp_server"
         pause
         ;;
       6)
@@ -4193,6 +4636,7 @@ ntp_sync() {
         pause
         ;;
       0) return ;;
+      99) exit 0 ;;
       *) echo "❌ 无效选项"; pause ;;
     esac
   done
@@ -4223,10 +4667,15 @@ casaos_panel() {
   if [[ $install_confirm =~ ^[Yy]$ ]]; then
     echo "开始安装 CasaOS..."
 
-    # 官方安装脚本
+    # 修复：用 set +e + trap 包裹远程命令，避免 curl 失败被 set -e 中断而错过错误提示
+    set +e
+    trap 'set -e' RETURN
     curl -fsSL https://get.casaos.io | bash
+    local casa_rc=$?
+    set -e
+    trap - RETURN
 
-    if [ $? -eq 0 ]; then
+    if [ $casa_rc -eq 0 ]; then
       echo "✅ CasaOS 安装完成！"
       echo "🌐 访问地址: http://你的服务器IP:80"
       echo "👤 默认用户名: admin"
@@ -4234,7 +4683,7 @@ casaos_panel() {
       echo ""
       echo "首次访问会要求设置密码，请及时修改！"
     else
-      echo "❌ CasaOS 安装失败"
+      echo "❌ CasaOS 安装失败（退出码: $casa_rc）"
       echo "请检查网络连接或查看官方文档: https://casaos.io/"
     fi
   else
@@ -4269,6 +4718,8 @@ quick_tools_menu() {
     echo "14) 安装NFS客户端           15) 查看目录占用"
     echo "16) 修改虚拟内存使用率      17) 安装基础工具包（apt）"
     echo "18) 安装基础工具包（yum）   19) 关闭宝塔面板SSL"
+    echo "30) SMB共享管理（Samba）"
+    echo "31) 硬盘管理（创建/挂载/扩容）"
     echo ""
     echo "【群辉工具】"
     echo "20) 群辉查看状态            21) 群辉查看硬盘温度"
@@ -4282,7 +4733,8 @@ quick_tools_menu() {
     echo "【系统重装】"
     echo "29) DD重装系统"
     echo ""
-    echo "0) 返回主菜单"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
     echo "=========================================="
     read -rp "请选择: " choice
     
@@ -4306,6 +4758,8 @@ quick_tools_menu() {
       17) install_apt_tools ;;
       18) install_yum_tools ;;
       19) disable_bt_ssl ;;
+      30) samba_share_menu ;;
+      31) disk_management_menu ;;
       20) synology_status ;;
       21) synology_disk_temp ;;
       22) synology_dir_permissions ;;
@@ -4317,6 +4771,7 @@ quick_tools_menu() {
       28) enter_pve_images ;;
       29) dd_reinstall ;;
       0) return ;;
+      99) exit 0 ;;
       *) error "无效选项"; pause ;;
     esac
   done
@@ -4337,10 +4792,12 @@ install_tcpx_bbr() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   wget -N --no-check-certificate "https://github.000060000.xyz/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4358,10 +4815,12 @@ install_bbr_optimize() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -Ls https://github.com/lanziii/bbr-/releases/download/123/tools.sh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4380,10 +4839,12 @@ install_nezha() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   curl -L https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh -o nezha.sh && chmod +x nezha.sh && sudo ./nezha.sh
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4401,10 +4862,12 @@ install_3xui() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4422,10 +4885,12 @@ install_hui() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -fsSL https://raw.githubusercontent.com/jonssonyan/h-ui/main/install.sh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4443,10 +4908,12 @@ install_sui() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -Ls https://raw.githubusercontent.com/alireza0/s-ui/master/install.sh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4464,10 +4931,12 @@ install_mcsmanager() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   sudo su -c "wget -qO- https://script.mcsmanager.com/setup_cn.sh | bash"
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4486,10 +4955,12 @@ test_besttrace() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   wget -qO- git.io/besttrace | bash
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4507,10 +4978,12 @@ test_mtr_trace() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   curl https://raw.githubusercontent.com/zhucaidan/mtr_trace/main/mtr_trace.sh|bash
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4528,10 +5001,12 @@ test_superspeed() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -Lso- https://git.io/superspeed_uxh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4549,14 +5024,483 @@ test_ip_quality() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -Ls IP.Check.Place)
   set -e
+  trap - RETURN
   pause
 }
 
+# ---------- 硬盘管理 ----------
+disk_management_menu() {
+  while true; do
+    clear
+    echo "=========================================="
+    echo "              硬盘管理"
+    echo "=========================================="
+    echo "1) 查看磁盘和分区（lsblk）"
+    echo "2) 查看磁盘使用情况（df -h）"
+    echo "3) 查看文件系统（lsblk -f）"
+    echo "4) 首次创建分区、格式化并挂载"
+    echo "5) 扩容分区及文件系统（PVE 扩大虚拟盘后）"
+    echo "6) 卸载挂载点"
+    echo "7) 挂载已有分区"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
+    read -rp "请选择: " choice
+    case "$choice" in
+      1) lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL; pause ;;
+      2) df -hT; pause ;;
+      3) lsblk -f; pause ;;
+      4) disk_create_and_mount ;;
+      5) disk_expand_partition ;;
+      6) disk_unmount ;;
+      7) disk_mount_existing ;;
+      0) return ;;
+      99) exit 0 ;;
+      *) error "无效选项"; pause ;;
+    esac
+  done
+}
+
+disk_require_tools() {
+  local tool
+  for tool in "$@"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      error "缺少必要命令：$tool"
+      return 1
+    fi
+  done
+}
+
+disk_create_and_mount() {
+  clear
+  echo "=========================================="
+  echo "       首次创建分区并挂载硬盘"
+  echo "=========================================="
+  warn "此流程会清除目标整块磁盘上的数据，并创建新的 GPT 分区表。"
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+  read -rp "请输入整块磁盘设备（例如 /dev/sdb；不要输入分区号）: " disk
+  if [[ ! "$disk" =~ ^/dev/[A-Za-z0-9._/-]+$ || ! -b "$disk" ]]; then
+    error "设备路径无效或设备不存在"
+    pause
+    return 1
+  fi
+  if lsblk -nrpo MOUNTPOINT "$disk" | grep -q '[^[:space:]]'; then
+    error "该磁盘或其分区已有挂载点，请先确认并卸载后再操作"
+    pause
+    return 1
+  fi
+  if lsblk -nrpo TYPE "$disk" | grep -qx 'rom'; then
+    error "不能对光驱设备执行此操作"
+    pause
+    return 1
+  fi
+  read -rp "文件系统类型（ext4/xfs，默认 ext4）: " fs_type
+  fs_type=${fs_type:-ext4}
+  if [[ "$fs_type" != "ext4" && "$fs_type" != "xfs" ]]; then
+    error "仅支持 ext4 和 xfs"
+    pause
+    return 1
+  fi
+  read -rp "挂载目录（例如 /mnt/data）: " mount_point
+  if [[ "$mount_point" != /* || "$mount_point" == "/" || "$mount_point" == *$'\n'* ]]; then
+    error "请输入非根目录的绝对路径"
+    pause
+    return 1
+  fi
+  if mountpoint -q "$mount_point" 2>/dev/null; then
+    error "目标目录已经是挂载点"
+    pause
+    return 1
+  fi
+  echo "即将清除 $disk 上的所有数据，创建单一分区并格式化为 $fs_type。"
+  read -rp "再次输入磁盘设备名 $disk 确认: " disk_confirm
+  if [[ "$disk_confirm" != "$disk" ]]; then
+    info "操作已取消"
+    pause
+    return
+  fi
+  if ! disk_require_tools parted mkfs."$fs_type" blkid mount; then pause; return 1; fi
+  if ! parted -s "$disk" mklabel gpt mkpart primary "$fs_type" 1MiB 100%; then
+    error "创建分区表或分区失败"
+    pause
+    return 1
+  fi
+  partprobe "$disk" 2>/dev/null || true
+  udevadm settle 2>/dev/null || true
+  local partition="${disk}1"
+  if [[ "$disk" =~ [0-9]$ ]]; then partition="${disk}p1"; fi
+  for _ in {1..10}; do
+    [[ -b "$partition" ]] && break
+    sleep 1
+  done
+  if [[ ! -b "$partition" ]]; then
+    error "未发现新分区 $partition；请检查设备并运行 lsblk"
+    pause
+    return 1
+  fi
+  if ! mkfs -t "$fs_type" -F "$partition"; then
+    error "格式化失败；请检查分区状态"
+    pause
+    return 1
+  fi
+  if ! mkdir -p -- "$mount_point"; then
+    error "无法创建挂载目录"
+    pause
+    return 1
+  fi
+  if ! mount "$partition" "$mount_point"; then
+    error "分区创建成功但挂载失败"
+    pause
+    return 1
+  fi
+  local uuid
+  uuid=$(blkid -s UUID -o value "$partition")
+  if [[ -z "$uuid" ]]; then
+    error "挂载成功但无法读取分区 UUID；未自动写入 fstab"
+    pause
+    return 1
+  fi
+  if ! grep -Fq "UUID=$uuid " /etc/fstab; then
+    printf 'UUID=%s %s %s defaults,nofail 0 2\n' "$uuid" "$mount_point" "$fs_type" >> /etc/fstab || {
+      error "已挂载，但写入 /etc/fstab 失败，请检查开机挂载设置"; pause; return 1;
+    }
+  fi
+  ok "$partition 已格式化并挂载到 $mount_point，已配置开机自动挂载"
+  df -hT "$mount_point"
+  pause
+}
+
+disk_expand_partition() {
+  clear
+  echo "=========================================="
+  echo "    扩容分区和文件系统（PVE）"
+  echo "=========================================="
+  warn "请先在 PVE 中扩大虚拟磁盘，并确认备份。此操作会修改分区表。"
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+  read -rp "请输入需要扩容的分区（例如 /dev/sdb1）: " partition
+  if [[ ! "$partition" =~ ^/dev/[A-Za-z0-9._/-]+$ || ! -b "$partition" ]]; then
+    error "分区路径无效或设备不存在"
+    pause
+    return 1
+  fi
+  if ! command -v findmnt >/dev/null 2>&1; then
+    error "缺少 findmnt 命令"
+    pause
+    return 1
+  fi
+  local mount_point parent fs_type part_num parent_type
+  mount_point=$(findmnt -n -o TARGET --source "$partition" 2>/dev/null | head -n1) || true
+  fs_type=$(blkid -s TYPE -o value "$partition" 2>/dev/null) || true
+  parent=$(lsblk -n -o PKNAME "$partition" | head -n1) || true
+  if [[ -z "$parent" || -z "$mount_point" ]]; then
+    error "无法识别该分区的父磁盘或挂载点；请确保它是已挂载的普通分区"
+    pause
+    return 1
+  fi
+  if [[ "$fs_type" != "ext4" && "$fs_type" != "xfs" ]]; then
+    error "暂不支持自动扩容文件系统：${fs_type:-未知}（支持 ext4、xfs）"
+    pause
+    return 1
+  fi
+  parent="/dev/$parent"
+  parent_type=$(lsblk -n -o TYPE "$parent" | head -n1)
+  if [[ "$parent_type" != "disk" ]]; then
+    error "父设备不是普通整盘，请勿自动扩容"
+    pause
+    return 1
+  fi
+  part_num=$(lsblk -n -o PARTN "$partition" | head -n1 | tr -d '[:space:]') || true
+  if [[ ! "$part_num" =~ ^[0-9]+$ ]]; then
+    error "无法读取分区编号"
+    pause
+    return 1
+  fi
+  echo "目标分区：$partition"
+  echo "父磁盘：$parent；文件系统：$fs_type；挂载点：$mount_point"
+  read -rp "输入分区路径 $partition 确认扩容: " expand_confirm
+  if [[ "$expand_confirm" != "$partition" ]]; then
+    info "操作已取消"
+    pause
+    return
+  fi
+  if ! disk_require_tools growpart; then
+    echo "Debian/Ubuntu 可安装 cloud-guest-utils；RHEL 系可安装 cloud-utils-growpart。"
+    pause
+    return 1
+  fi
+  if ! growpart "$parent" "$part_num"; then
+    error "分区扩容失败；磁盘可能尚未扩容或已无可用空间"
+    pause
+    return 1
+  fi
+  case "$fs_type" in
+    ext4)
+      if ! command -v resize2fs >/dev/null 2>&1 || ! resize2fs "$partition"; then
+        error "分区已扩容，但 ext4 文件系统扩容失败；可检查后运行 resize2fs $partition"
+        pause
+        return 1
+      fi
+      ;;
+    xfs)
+      if ! command -v xfs_growfs >/dev/null 2>&1 || ! xfs_growfs "$mount_point"; then
+        error "分区已扩容，但 XFS 文件系统扩容失败；可检查后运行 xfs_growfs $mount_point"
+        pause
+        return 1
+      fi
+      ;;
+  esac
+  ok "分区及文件系统扩容完成"
+  df -hT "$mount_point"
+  pause
+}
+
+disk_unmount() {
+  read -rp "请输入挂载点（例如 /mnt2）: " mount_point
+  if [[ "$mount_point" != /* || "$mount_point" == "/" ]]; then
+    error "请输入非根目录的绝对挂载路径"
+  elif ! mountpoint -q "$mount_point"; then
+    error "$mount_point 当前不是挂载点"
+  elif umount -- "$mount_point"; then
+    ok "已卸载 $mount_point"
+  else
+    error "卸载失败；请检查是否有进程正在使用该目录"
+  fi
+  pause
+}
+
+disk_mount_existing() {
+  read -rp "请输入分区设备（例如 /dev/sdb1）: " partition
+  if [[ ! "$partition" =~ ^/dev/[A-Za-z0-9._/-]+$ || ! -b "$partition" ]]; then
+    error "分区路径无效或设备不存在"
+    pause
+    return 1
+  fi
+  read -rp "请输入挂载目录（例如 /mnt2）: " mount_point
+  if [[ "$mount_point" != /* || "$mount_point" == "/" ]]; then
+    error "请输入非根目录的绝对路径"
+  elif mountpoint -q "$mount_point"; then
+    error "目标目录已经是挂载点"
+  elif mkdir -p -- "$mount_point" && mount -- "$partition" "$mount_point"; then
+    ok "已将 $partition 挂载到 $mount_point"
+    echo "临时挂载仅在本次启动有效；如需持久挂载，请使用分区 UUID 配置 /etc/fstab。"
+    df -hT "$mount_point"
+  else
+    error "挂载失败；请使用 lsblk -f 检查文件系统和挂载状态"
+  fi
+  pause
+}
+
+# ---------- 硬盘管理结束 ----------
+
 # ---------- 系统工具相关 ----------
+samba_share_menu() {
+  while true; do
+    clear
+    echo "=========================================="
+    echo "         SMB共享管理（Samba）"
+    echo "=========================================="
+    echo "1) 安装/更新 Samba"
+    echo "2) 新建或更新共享目录"
+    echo "3) 查看共享和服务状态"
+    echo "4) 启动并设置开机自启"
+    echo "5) 停止 Samba 服务"
+    echo "0) 返回上级菜单"
+    echo "99) 退出脚本"
+    read -rp "请选择: " choice
+    case "$choice" in
+      1) samba_install ;;
+      2) samba_configure_share ;;
+      3) samba_show_status ;;
+      4) samba_service_action start ;;
+      5) samba_service_action stop ;;
+      0) return ;;
+      99) exit 0 ;;
+      *) error "无效选项"; pause ;;
+    esac
+  done
+}
+
+samba_install() {
+  clear
+  echo "=========================================="
+  echo "         安装 Samba"
+  echo "=========================================="
+  local rc=0
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y samba smbclient; then
+      rc=0
+    else
+      rc=$?
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    if dnf install -y samba samba-client; then
+      rc=0
+    else
+      rc=$?
+    fi
+  elif command -v yum >/dev/null 2>&1; then
+    if yum install -y samba samba-client; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    error "未检测到支持的包管理器（apt、dnf 或 yum）"
+    pause
+    return 1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "Samba 安装完成"
+  else
+    error "Samba 安装失败（退出码：$rc）"
+  fi
+  pause
+  return "$rc"
+}
+
+samba_configure_share() {
+  clear
+  echo "=========================================="
+  echo "         配置 SMB 共享"
+  echo "=========================================="
+  if ! command -v smbpasswd >/dev/null 2>&1; then
+    error "未检测到 Samba，请先选择安装/更新 Samba"
+    pause
+    return 1
+  fi
+
+  read -rp "共享名称（仅字母、数字、下划线、短横线）: " share_name
+  if [[ ! "$share_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    error "共享名称格式无效"
+    pause
+    return 1
+  fi
+  read -rp "共享目录（默认 /srv/samba/$share_name）: " share_path
+  share_path=${share_path:-"/srv/samba/$share_name"}
+  if [[ "$share_path" != /* || "$share_path" == *$'\n'* ]]; then
+    error "请输入有效的绝对目录路径"
+    pause
+    return 1
+  fi
+  read -rp "Samba 用户名（默认当前 root）: " samba_user
+  samba_user=${samba_user:-root}
+  if [[ ! "$samba_user" =~ ^[A-Za-z0-9_.-]+$ ]] || ! id "$samba_user" >/dev/null 2>&1; then
+    error "系统用户无效；请先创建该 Linux 用户"
+    pause
+    return 1
+  fi
+
+  read -rp "是否同时将共享目录现有文件设置为所有用户可读写（递归修改权限）? [y/N]: " recursive_perm
+  if ! mkdir -p -- "$share_path" || ! chmod 0777 -- "$share_path"; then
+    error "创建共享目录或设置权限失败"
+    pause
+    return 1
+  fi
+  if [[ "$recursive_perm" =~ ^[Yy]$ ]] && ! chmod -R a+rwX -- "$share_path"; then
+    error "递归设置现有内容权限失败"
+    pause
+    return 1
+  fi
+  if ! pdbedit -L 2>/dev/null | cut -d: -f1 | grep -Fxq -- "$samba_user"; then
+    if ! smbpasswd -a "$samba_user"; then
+      error "添加 Samba 用户失败"
+      pause
+      return 1
+    fi
+  else
+    info "Samba 用户已存在；如需修改密码请运行 smbpasswd $samba_user"
+  fi
+
+  local conf="/etc/samba/smb.conf"
+  if [ ! -f "$conf" ]; then
+    error "Samba 配置文件不存在：$conf"
+    pause
+    return 1
+  fi
+  local tmp_conf
+  tmp_conf=$(mktemp) || { error "无法创建临时配置文件"; pause; return 1; }
+  awk -v name="$share_name" '
+    BEGIN { skip=0; section="[" name "]" }
+    /^[[:space:]]*\[/ {
+      if ($0 == section) { skip=1; next }
+      skip=0
+    }
+    !skip { print }
+  ' "$conf" > "$tmp_conf" || { rm -f "$tmp_conf"; error "读取 Samba 配置失败"; pause; return 1; }
+  cat >> "$tmp_conf" <<EOF
+
+[$share_name]
+   path = $share_path
+   browseable = yes
+   read only = no
+   guest ok = no
+   valid users = $samba_user
+   create mask = 0777
+   force create mode = 0777
+   directory mask = 0777
+   force directory mode = 0777
+EOF
+  if ! testparm -s "$tmp_conf" >/dev/null 2>&1; then
+    rm -f "$tmp_conf"
+    error "Samba 配置校验失败，原配置未修改"
+    pause
+    return 1
+  fi
+  cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)" || { rm -f "$tmp_conf"; error "备份原配置失败"; pause; return 1; }
+  if ! install -m 0644 "$tmp_conf" "$conf"; then
+    rm -f "$tmp_conf"
+    error "写入 Samba 配置失败"
+    pause
+    return 1
+  fi
+  rm -f "$tmp_conf"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now smbd 2>/dev/null || systemctl enable --now smb 2>/dev/null || {
+      error "共享已写入，但 Samba 服务启动失败，请检查 systemctl 状态"; pause; return 1;
+    }
+    systemctl restart smbd 2>/dev/null || systemctl restart smb 2>/dev/null || {
+      error "配置已保存，但 Samba 服务重启失败"; pause; return 1;
+    }
+  fi
+  ok "共享 [$share_name] 配置完成"
+  echo "目录：$share_path"
+  echo "用户：$samba_user（使用 smbpasswd 设置的密码登录）"
+  warn "共享权限设置为 777，允许所有本机用户读写删除；请仅在可信网络开放 TCP 445，并保留账号密码认证。"
+  pause
+}
+
+samba_show_status() {
+  clear
+  echo "=========================================="
+  echo "         Samba 状态"
+  echo "=========================================="
+  if command -v testparm >/dev/null 2>&1; then
+    testparm -s 2>/dev/null | grep -E '^\[|^[[:space:]]*(path|valid users|read only|guest ok)[[:space:]]*=' || true
+  else
+    error "Samba 尚未安装"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --no-pager --full status smbd 2>/dev/null || systemctl --no-pager --full status smb 2>/dev/null || true
+  fi
+  pause
+}
+
+samba_service_action() {
+  local action="$1"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "系统未提供 systemctl，无法管理 Samba 服务"
+  elif systemctl "$action" smbd 2>/dev/null || systemctl "$action" smb 2>/dev/null; then
+    ok "Samba 服务操作完成：$action"
+  else
+    error "Samba 服务操作失败：$action"
+  fi
+  pause
+}
+
 install_rclone() {
   clear
   echo "=========================================="
@@ -4571,10 +5515,12 @@ install_rclone() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   curl https://rclone.org/install.sh | sudo bash
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4592,10 +5538,12 @@ install_natcfg() {
     pause
     return
   fi
-  
+
   set +e
+  trap 'set -e' RETURN
   bash <(curl -fsSL https://us.arloor.dev/https://raw.githubusercontent.com/arloor/iptablesUtils/master/natcfg.sh)
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4604,21 +5552,28 @@ install_nfs_client() {
   echo "=========================================="
   echo "         安装NFS客户端"
   echo "=========================================="
-  
-  if command -v apt-get &> /dev/null; then
+  local rc=0
+  if command -v apt-get >/dev/null 2>&1; then
     echo "检测到apt包管理器，使用apt安装..."
-    apt-get update && apt-get install nfs-common nfs-kernel-server -y
-  elif command -v yum &> /dev/null; then
+    if apt-get update && apt-get install -y nfs-common nfs-kernel-server; then rc=0; else rc=$?; fi
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "检测到dnf包管理器，使用dnf安装..."
+    if dnf install -y nfs-utils; then rc=0; else rc=$?; fi
+  elif command -v yum >/dev/null 2>&1; then
     echo "检测到yum包管理器，使用yum安装..."
-    yum install nfs-utils -y
+    if yum install -y nfs-utils; then rc=0; else rc=$?; fi
   else
     error "未检测到支持的包管理器"
     pause
-    return
+    return 1
   fi
-  
-  ok "NFS客户端安装完成"
+  if [ "$rc" -eq 0 ]; then
+    ok "NFS工具安装完成"
+  else
+    error "NFS工具安装失败（退出码：$rc）"
+  fi
   pause
+  return "$rc"
 }
 
 show_directory_usage() {
@@ -4655,9 +5610,11 @@ modify_swappiness() {
   cat /proc/sys/vm/swappiness
         echo ""
   read -rp "请输入新的使用率 (0-100，推荐1): " swappiness
-  
+
   if [[ "$swappiness" =~ ^[0-9]+$ ]] && [ "$swappiness" -ge 0 ] && [ "$swappiness" -le 100 ]; then
     sysctl -w vm.swappiness=$swappiness
+    # 修复：先去重再追加，避免多次运行后 /etc/sysctl.conf 累积重复条目
+    sed -i '/^vm\.swappiness=/d' /etc/sysctl.conf
     echo "vm.swappiness=$swappiness" >> /etc/sysctl.conf
     ok "虚拟内存使用率已设置为: $swappiness"
     echo "当前值:"
@@ -4675,10 +5632,19 @@ install_apt_tools() {
   echo "=========================================="
   echo "正在安装: nano wget zip fuse3 tar curl sudo unzip nfs-common nfs-kernel-server libzbar0"
   
-  apt-get update && apt update && apt-get install nano wget zip fuse3 tar curl sudo unzip nfs-common nfs-kernel-server libzbar0 -y
-  
-  ok "工具包安装完成"
+  local rc=0
+  if apt-get install -y nano wget zip fuse3 tar curl sudo unzip nfs-common nfs-kernel-server libzbar0; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "工具包安装完成"
+  else
+    error "工具包安装失败（退出码：$rc）"
+  fi
   pause
+  return "$rc"
 }
 
 install_yum_tools() {
@@ -4688,10 +5654,19 @@ install_yum_tools() {
   echo "=========================================="
   echo "正在安装: nano wget zip fuse3 tar unzip"
   
-  yum install nano wget zip fuse3 tar unzip -y
-  
-  ok "工具包安装完成"
+  local rc=0
+  if yum install -y nano wget zip fuse3 tar unzip; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "工具包安装完成"
+  else
+    error "工具包安装失败（退出码：$rc）"
+  fi
   pause
+  return "$rc"
 }
 
 disable_bt_ssl() {
@@ -4857,10 +5832,37 @@ install_pve_source() {
     pause
     return
   fi
-  
+
   set +e
-  wget -q -O /root/pve_source.tar.gz 'https://bbs.x86pi.cn/file/topic/2023-11-28/file/01ac88d7d2b840cb88c15cb5e19d4305b2.gz' && tar zxvf /root/pve_source.tar.gz && /root/./pve_source
+  trap 'set -e' RETURN
+  # 修复：先用 file 命令探测真实类型，避免 .gz 误判
+  local pve_file="/root/pve_source.bin"
+  wget -q -O "$pve_file" 'https://bbs.x86pi.cn/file/topic/2023-11-28/file/01ac88d7d2b840cb88c15cb5e19d4305b2.gz'
+  if [ ! -s "$pve_file" ]; then
+    error "下载失败或文件为空"
+    pause
+    return
+  fi
+  local ftype
+  ftype=$(file -b "$pve_file" 2>/dev/null)
+  if echo "$ftype" | grep -qi "gzip compressed"; then
+    mv "$pve_file" "${pve_file}.gz"
+    gunzip -f "${pve_file}.gz"
+  elif echo "$ftype" | grep -qi "tar archive\|POSIX tar"; then
+    mv "$pve_file" "${pve_file}.tar"
+    tar xvf "${pve_file}.tar" -C /root/
+  elif echo "$ftype" | grep -qi "ASCII text\|executable"; then
+    : # 已经下载好了，可直接执行
+  else
+    warn "未知文件类型: $ftype，尝试直接执行"
+  fi
+  if [ -x /root/pve_source ]; then
+    /root/./pve_source
+  else
+    error "PVE 脚本不存在或不可执行，请检查 /root/pve_source"
+  fi
   set -e
+  trap - RETURN
   pause
 }
 
@@ -4904,13 +5906,20 @@ dd_reinstall() {
     return
   fi
   
-  read -rp "请输入系统版本 (默认: debian 12): " os_version
+  read -rp "请输入系统版本（格式如 debian 12，默认: debian 12）: " os_version
   os_version=${os_version:-"debian 12"}
+  if [[ ! "$os_version" =~ ^[A-Za-z0-9._-]+[[:space:]][A-Za-z0-9._-]+$ ]]; then
+    error "系统版本格式无效，例如：debian 12"
+    pause
+    return
+  fi
+  read -ra os_args <<< "$os_version"
   
-  read -rp "请输入root密码 (默认: txrui): " root_pwd
+  read -rsp "请输入root密码 (默认: txrui): " root_pwd
+  echo
   root_pwd=${root_pwd:-"txrui"}
   
-  warn "最后确认：即将格式化系统并安装 $os_version，root密码: $root_pwd"
+  warn "最后确认：即将格式化系统并安装 $os_version"
   read -rp "输入 'CONFIRM' 最终确认: " final_confirm
   
   if [ "$final_confirm" != "CONFIRM" ]; then
@@ -4919,13 +5928,18 @@ dd_reinstall() {
     return
   fi
   
-  set +e
-  curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
-  bash reinstall.sh $os_version --password "$root_pwd"
-  set -e
+  local reinstall_script="/tmp/txrui-reinstall.sh"
+  if ! curl -fsSL https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh -o "$reinstall_script"; then
+    error "重装脚本下载失败"
+    rm -f "$reinstall_script"
+    pause
+    return 1
+  fi
+  if ! bash "$reinstall_script" "${os_args[@]}" --password "$root_pwd"; then
+    error "重装脚本执行失败，请查看上方错误信息"
+  fi
+  rm -f "$reinstall_script"
   pause
 }
-
-# ---------- 脚本入口 ----------
 check_system
 main_menu
